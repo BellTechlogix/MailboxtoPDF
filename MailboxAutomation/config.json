@@ -1,0 +1,43 @@
+{
+    "AzureAd": {
+        "TenantId": "1234",
+        "ClientId": "1234",
+        "CertPath": "/opt/ap-automation/graphcert/graph.crt",
+        "KeyPath": "/opt/ap-automation/graphcert/graph.key"
+    },
+    "Email": {
+        "TargetMailbox": "accounts@mydomain.com",
+        "BatchSize": 20,
+        "MinImageSizeBytes": 30000,
+        "AllowedExtensions": [
+            ".pdf",
+            ".tif",
+            ".tiff",
+            ".jpg",
+            ".jpeg",
+            ".xlsx",
+            ".csv",
+            ".doc",
+            ".docx"
+        ],
+        "GenericDomains": [
+            "gmail.com",
+            "yahoo.com",
+            "hotmail.com",
+            "comcast.net",
+            "aol.com",
+            "outlook.com",
+            "icloud.com",
+            "msn.com"
+        ],
+        "InternalDomains": [
+            "mydomain.com"
+        ]
+    },
+    "Paths": {
+        "Staging": "/opt/ap-automation/staging",
+        "LogFolder": "/opt/ap-automation/logs",
+        "SMBDestination": "/mnt/apauto",
+        "CSVPath": "/opt/ap-automation/configs/AP_Vendor_List.csv"
+    }
+}
