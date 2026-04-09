@@ -1,0 +1,23 @@
+# --- Visual Studio / IDE Files ---
+.vs/
+*.user
+*.userosscache
+*.sln.docstates
+
+# --- Build and Temporary Outputs ---
+bin/
+obj/
+out/
+
+# --- PowerShell Pro Tools Specific ---
+#.pssproject/
+
+# --- Local Secrets / Configuration ---
+# Only ignore config.json if it contains passwords or local API keys.
+# If it's just general settings, keep it tracked.
+# config.json
+
+# --- OS Junk ---
+Thumbs.db
+desktop.ini
+.DS_Store
