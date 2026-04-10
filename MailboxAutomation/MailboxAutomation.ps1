@@ -2,7 +2,7 @@
     GraphMailCheck.ps1
     Created By - Kristopher Roy
     Created On - 2026-03-20
-    Revised On - 2026-04-09
+    Revised On - 2026-04-10
     Modules Required: Microsoft.Graph.Authentication, Microsoft.Graph.Users
 
     .Important
@@ -43,6 +43,11 @@ $internalDomains = $config.Email.InternalDomains
 $allowedExtensions = $config.Email.AllowedExtensions
 $minImageSize = if ($config.Email.MinImageSizeBytes) { $config.Email.MinImageSizeBytes } else { 30000 }
 
+# --- NEW CONFIG VARIABLES ---
+$testFromEnabled = $config.Email.TestFromEnabled
+$testFromAddress = $config.Email.TestFromAddress
+$keyWordExceptions = $config.Email.KeyWordExceptions
+
 try {
     Write-Host "Connecting to Graph..." -ForegroundColor Cyan
     $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile($certPath, $keyPath)
@@ -50,8 +55,18 @@ try {
 
     Write-Host "[GOOD] Connected. Fetching Inbox Messages..." -ForegroundColor Cyan
 
-    #$messages = Get-MgUserMailFolderMessage -UserId $targetMailbox -MailFolderId "Inbox" -Top 25 -Filter "hasAttachments eq true" -Select "id,subject,from,receivedDateTime,hasAttachments"
-    $messages = Get-MgUserMailFolderMessage -UserId $targetMailbox -MailFolderId "Inbox" -all -Filter "from/emailAddress/address eq 'kroy@belltechlogix.com' and hasAttachments eq true" -Select "id,subject,from,receivedDateTime,hasAttachments"
+    # --- INBOX FILTERING LOGIC ---
+    # Deprecated: #$messages = Get-MgUserMailFolderMessage -UserId $targetMailbox -MailFolderId "Inbox" -Top 25 -Filter "hasAttachments eq true" -Select "id,subject,from,receivedDateTime,hasAttachments"
+    # Deprecated: $messages = Get-MgUserMailFolderMessage -UserId $targetMailbox -MailFolderId "Inbox" -all -Filter "from/emailAddress/address eq 'kroy@belltechlogix.com' and hasAttachments eq true" -Select "id,subject,from,receivedDateTime,hasAttachments"
+    
+    if ($testFromEnabled -eq $true) {
+        Write-Host " [INFORMATIONAL] Test mode is ENABLED. Filtering only for emails from: $testFromAddress" -ForegroundColor Magenta
+        $filterQuery = "from/emailAddress/address eq '$testFromAddress' and hasAttachments eq true"
+    } else {
+        $filterQuery = "hasAttachments eq true"
+    }
+    
+    $messages = Get-MgUserMailFolderMessage -UserId $targetMailbox -MailFolderId "Inbox" -all -Filter $filterQuery -Select "id,subject,from,receivedDateTime,hasAttachments"
 
     if ($messages.Count -eq 0) {
         Write-Host "[INFORMATIONAL] No new emails with attachments found." -ForegroundColor Yellow
@@ -67,31 +82,88 @@ try {
         Write-Host "Processing Email: $($msg.Subject)" -ForegroundColor White
         Write-Host "Sender Email:   $senderEmail" -ForegroundColor Gray
         
+        # --- 0. STATEMENT & PAST DUE KILL SWITCH ---
+        # Deprecated: $killRegex = "(?i)(statement|statements|past due|past-due|pastdue)"
+        
+        # Dynamically build the Regex from the JSON array
+        $escapedKeywords = $keyWordExceptions | ForEach-Object { [regex]::Escape($_) }
+        $killRegex = "(?i)(" + ($escapedKeywords -join "|") + ")"
+        
+        $hasKillKeyword = $false
+        
+        # Check Subject Line
+        if ($msg.Subject -match $killRegex) {
+            $hasKillKeyword = $true
+        }
+        
+        # Fetch attachments early so we can check their names for the kill words
+        $attachments = Get-MgUserMessageAttachment -UserId $targetMailbox -MessageId $msg.Id -Select "id,name,contentType,size"
+        
+        if (-not $hasKillKeyword -and $attachments) {
+            foreach ($att in $attachments) {
+                if ($att.Name -match $killRegex) {
+                    $hasKillKeyword = $true
+                    break
+                }
+            }
+        }
+
+        if ($hasKillKeyword) {
+            Write-Host " [SKIP] Email contains Statement or Past Due keyword. Leaving untouched." -ForegroundColor Yellow
+            continue
+        }
+
         # --- 1. THE WATERFALL MATCHING LOGIC ---
         $supplierName = "Unknown"
 
         foreach ($row in $mapping) {
-            $csvMatchEmail = $row.'Email - Vendor Match'.Trim().ToLower()
-            $csvDomain     = $row.'Domain'.Trim().ToLower()
+            $csvApVendorList = $row.'Email - AP Vendor List'.Trim().ToLower()
+            $csvVendorMatch  = $row.'Email - Vendor Match'.Trim().ToLower()
+            $csvDomain       = $row.'Domain'.Trim().ToLower()
 
-            # WATERFALL 1: Exact Email Match
-            if ($senderEmail -eq $csvMatchEmail) {
+            # WATERFALL 1: Exact Email Match (Primary)
+            if ($csvApVendorList -ne "" -and $senderEmail -eq $csvApVendorList) {
                 $supplierName = $row.'Supplier Name'
-                Write-Host " [GOOD] Matched via Exact Email -> $supplierName" -ForegroundColor Green
+                Write-Host " [GOOD] Matched via AP Vendor List -> $supplierName" -ForegroundColor Green
                 break
             }
             
-            # WATERFALL 2: Safe Domain Match
-            if ($senderDomain -eq $csvDomain -and $senderDomain -notin $genericDomains -and $senderDomain -notin $internalDomains) {
+            # WATERFALL 2: Exact Email Match (Secondary)
+            # Was: if ($senderEmail -eq $csvMatchEmail) { ...
+            if ($csvVendorMatch -ne "" -and $senderEmail -eq $csvVendorMatch) {
+                $supplierName = $row.'Supplier Name'
+                Write-Host " [GOOD] Matched via Vendor Match -> $supplierName" -ForegroundColor Green
+                break
+            }
+            
+            # WATERFALL 3: Safe Domain Match
+            if ($csvDomain -ne "" -and $senderDomain -eq $csvDomain -and $senderDomain -notin $genericDomains -and $senderDomain -notin $internalDomains) {
                 $supplierName = $row.'Supplier Name'
                 Write-Host " [GOOD] Matched via Corporate Domain -> $supplierName" -ForegroundColor Green
                 break
             }
         }
 
+        # --- NEW EARLY FOLDER ROUTING (Needed for Collision Detection) ---
+        if ($supplierName -eq "Unknown") {
+            Write-Host " [WARNING] No Match Found. Leaving email untouched in Inbox." -ForegroundColor Yellow
+            continue 
+        } else {
+            $firstLetter = $supplierName.Substring(0,1).ToUpper()
+            if ($firstLetter -match "[A-Z]") {
+                $targetSubFolder = $firstLetter
+            } else {
+                $targetSubFolder = "#"
+            }
+        }
+        $finalSmbPath = Join-Path $config.Paths.SMBDestination $targetSubFolder
+
         # --- 2. ATTACHMENT INSPECTION & RENAMING BLOCK ---
-        $attachments = Get-MgUserMessageAttachment -UserId $targetMailbox -MessageId $msg.Id -Select "id,name,contentType,size"
+        # Deprecated: $attachments = Get-MgUserMessageAttachment -UserId $targetMailbox -MessageId $msg.Id -Select "id,name,contentType,size"
+        # (Attachments are now fetched in Step 0)
+        
         $validAttachments = @()
+        $dateStamp = Get-Date -Format "yyyyMMdd"
 
         if ($attachments) {
             foreach ($att in $attachments) {
@@ -109,9 +181,35 @@ try {
 
                     Write-Host "  -> [KEEP] Found Invoice: $($att.Name)" -ForegroundColor Green
                     
-                    # Call our new function to generate the cleaned, prepended file name
-                    $newFileName = Format-InvoiceName -SupplierName $supplierName -OriginalFileName $att.Name
+                    # --- HYBRID FILE NAMING & COLLISION DETECTION ---
+                    # Deprecated: $newFileName = Format-InvoiceName -SupplierName $supplierName -OriginalFileName $att.Name
+                    
+                    $nameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($att.Name)
+                    $cleanSupplier = $supplierName -replace '[^a-zA-Z0-9\s\-]', ''
+                    $cleanSupplier = ($cleanSupplier -replace '\s+', '-') -replace '\-+', '-'
+                    $cleanSupplier = $cleanSupplier.TrimEnd('-')
+                    
+                    # Base Name: Vendor Name - Date Stamp - OriginalFileName
+                    $baseName = "$cleanSupplier-$dateStamp-$nameWithoutExt"
+                    $counter = 0
+                    
+                    # Check SMB destination to see if a PDF with this name already exists
+                    $finalPdfName = "$baseName.pdf"
+                    while (Test-Path (Join-Path $finalSmbPath $finalPdfName)) {
+                        $counter++
+                        $paddedCounter = "{0:D2}" -f $counter
+                        $finalPdfName = "$baseName($paddedCounter).pdf"
+                    }
+                    
+                    # Apply the generated suffix to the staging file so it retains its native extension for conversion
+                    if ($counter -eq 0) {
+                        $newFileName = "$baseName$ext"
+                    } else {
+                        $newFileName = "$baseName($paddedCounter)$ext"
+                    }
+                    
                     Write-Host "  -> [RENAMING] New Invoice Name: $newFileName" -ForegroundColor Magenta
+                    # ------------------------------------------------
                     
                     # --- DOWNLOAD & CONVERSION ENGINE ---
                     $stagingPath = Join-Path $config.Paths.Staging $newFileName
@@ -178,19 +276,20 @@ try {
         }
 
         # --- 3. FOLDER ROUTING LOGIC ---
-        if ($supplierName -eq "Unknown") {
-            Write-Host " [WARNING] No Match Found. Routing to Exceptions." -ForegroundColor Yellow
-            $targetSubFolder = "Exceptions"
-        } else {
-            $firstLetter = $supplierName.Substring(0,1).ToUpper()
-            if ($firstLetter -match "[A-Z]") {
-                $targetSubFolder = $firstLetter
-            } else {
-                $targetSubFolder = "#"
-            }
-        }
-
-        $finalSmbPath = Join-Path $config.Paths.SMBDestination $targetSubFolder
+        # <--- OLD ROUTING LOGIC DEPRECATED (Moved to Step 1 for Collision Support) --->
+        # if ($supplierName -eq "Unknown") {
+        #     Write-Host " [WARNING] No Match Found. Routing to Exceptions." -ForegroundColor Yellow
+        #     $targetSubFolder = "Exceptions"
+        # } else {
+        #     $firstLetter = $supplierName.Substring(0,1).ToUpper()
+        #     if ($firstLetter -match "[A-Z]") {
+        #         $targetSubFolder = $firstLetter
+        #     } else {
+        #         $targetSubFolder = "#"
+        #     }
+        # }
+        # $finalSmbPath = Join-Path $config.Paths.SMBDestination $targetSubFolder
+        
         Write-Host " Routing $($validAttachments.Count) file(s) to SMB Folder: $finalSmbPath" -ForegroundColor Cyan
         
         # --- SIMULATE ACCESS (READ-ONLY TEST) ---
