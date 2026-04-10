@@ -6,6 +6,7 @@
     "KeyPath": "/opt/ap-automation/graphcert/graph.key"
   },
   "Email": {
+    "SimulateMove":  true,
     "TargetMailbox": "accounts@mydomain.com",
     "BatchSize": 20,
     "MinImageSizeBytes": 30000,
@@ -44,9 +45,18 @@
     ]
   },
   "Paths": {
+    "SimulateSMB": true,
     "Staging": "/opt/ap-automation/staging",
     "LogFolder": "/opt/ap-automation/logs",
+    "Runtime_Log": "/opt/ap-automation/logs/Runtime.log",
+    "Error_Log": "/opt/ap-automation/logs/Error.log",
     "SMBDestination": "/mnt/apauto",
     "CSVPath": "/opt/ap-automation/configs/AP_Vendor_List.csv"
+  },
+  "Logging": {
+    "Verbose": true,
+    "Runtime": true,
+    "Circular": true,
+    "Log_Size": "50MB"
   }
 }

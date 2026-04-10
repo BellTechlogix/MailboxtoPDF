@@ -1,37 +1,98 @@
 ﻿<#
-    GraphMailCheck.ps1
+    MailboxAutomation.ps1
     Created By - Kristopher Roy
     Created On - 2026-03-20
     Revised On - 2026-04-10
+    Revised On - 2026-03-20 (Descriptive Comments Added)
     Modules Required: Microsoft.Graph.Authentication, Microsoft.Graph.Users
 
     .Important
-    - This script uses a hardcoded Linux-style path (/opt/ap-automation/). Ensure the execution environment is Linux or a compatible WSL/Container instance.
-    - Requires a valid X.509 certificate and private key in PEM format for service principal authentication.
+    - EXECUTION ENVIRONMENT: This script is hardcoded for Linux paths (/opt/ap-automation/). 
+      It will fail on Windows without WSL or significant path refactoring.
+    - EXTERNAL DEPENDENCIES: Requires 'libreoffice' and 'img2pdf' to be available in the 
+      system PATH for document and image conversion. As well as config.json.
+    - AUTHENTICATION: Uses X.509 Certificate thumbprint/path. Ensure the service principal 
+      has 'Mail.ReadWrite' permissions in Azure AD.
+      Assumes permissions and mapping of the SMB folder paths.
+
+    .DESCRIPTION
+    Automates the ingestion of AP invoices from a Microsoft 365 mailbox. The script:
+    1. Authenticates via MS Graph using a certificate.
+    2. Filters inbox messages for attachments and specific 'Test Mode' senders.
+    3. Employs a 'Waterfall' matching logic to map senders to vendors via CSV.
+    4. Sanitizes filenames, handles naming collisions, and converts non-PDF attachments 
+       (Office docs, CSVs, Images) into standardized PDF format using LibreOffice and img2pdf.
+    5. Routes files to a tiered SMB directory structure based on vendor naming.
+    6. Added logging functionality: Circular (Bulk end-of-run trim), Verbose, Error, and Runtime history tracking.
+       Includes Dual-pipe abstraction, correlation IDs, and global error trapping.
+
+    .VERSION
+    1.4
+
+    .NOTES
+    - Explicit regex sanitization is used for vendor names to prevent directory traversal.
+    - Collision detection (suffixing files with (01), (02)) prevents overwriting 
+      existing invoices on the SMB share.
 #>
 
+# ------
+# 1. PATH DEPENDENCY: Script assumes /opt/ap-automation/ presence. Mitigation: Verify volume mounts in container/host.
+# 2. EXTERNAL BINARIES: 'libreoffice' and 'img2pdf' failures are caught but will skip file conversion.
+# 3. GRAPH SDK BUG: Uses Invoke-MgGraphRequest for attachments to bypass known Base64 casting issues in Mg-UserMessageAttachment.
+# 4. DATA INTEGRITY: Mapping CSV must have specific headers: 'Email - AP Vendor List', 'Email - Vendor Match', 'Domain', 'Supplier Name'.
+
+# --- GLOBAL ERROR TRAP & RUN IDENTITY ---
+$ErrorActionPreference = "Stop" # Prevents silent failures
+$global:RunID = "RUN-$(Get-Date -Format 'yyyyMMddHHmm')-$((Get-Random -Maximum 9999).ToString('0000'))"
+
 # --- HELPER FUNCTIONS ---
+function Write-Log {
+    param (
+        [string]$Message,
+        [ValidateSet("ERROR", "WARN", "INFO", "SUCCESS", "DEBUG")]
+        [string]$Level = "INFO",
+        [string]$LogType = "Error", # "Error" or "Runtime"
+        [string]$MsgID = "SYS",
+        [System.ConsoleColor]$Color = "Cyan"
+    )
+
+    # --- 1. CONSOLE OUTPUT (The Dual Pipe) ---
+    # Only print to screen if it's the Error/Verbose log (Runtime log is for files only)
+    if ($LogType -ne "Runtime") {
+        Write-Host $Message -ForegroundColor $Color
+    }
+
+    # --- 2. CONFIGURATION GATEKEEPERS ---
+    if ($LogType -eq "Runtime" -and $config.Logging.Runtime -ne $true) {
+        return 
+    }
+    if ($LogType -eq "Error" -and $Level -notin @("ERROR", "WARN") -and $config.Logging.Verbose -ne $true) {
+        return 
+    }
+
+    # --- 3. APPEND TO FILE (Fast Path) ---
+    $logPath = if ($LogType -eq "Runtime") { $config.Paths.Runtime_Log } else { $config.Paths.Error_Log }
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $formattedMessage = "[$timestamp] [$global:RunID] [$MsgID] [$Level] - $Message"
+
+    $formattedMessage | Out-File -FilePath $logPath -Append -Encoding UTF8
+}
+
 function Format-InvoiceName {
     param (
         [string]$SupplierName,
         [string]$OriginalFileName
     )
-    
-    # 1. Strip out everything except letters, numbers, spaces, and hyphens
     $cleanSupplier = $SupplierName -replace '[^a-zA-Z0-9\s\-]', ''
-    
-    # 2. Replace all spaces with dashes, and collapse multiple dashes into a single dash
     $cleanSupplier = ($cleanSupplier -replace '\s+', '-') -replace '\-+', '-'
-    
-    # 3. Trim any trailing dashes just in case, then combine with the original file name
     $cleanSupplier = $cleanSupplier.TrimEnd('-')
-    
     return "$cleanSupplier-$OriginalFileName"
 }
 
-# --- INITIALIZATION ---
+# --- INITIALIZATION of CONFIG FILE---
 $config = Get-Content "/opt/ap-automation/configs/config.json" | ConvertFrom-Json
 
+# --- CONFIG VARIABLES ---
 $certPath = $config.AzureAd.CertPath
 $keyPath  = $config.AzureAd.KeyPath
 $clientId = $config.AzureAd.ClientId
@@ -43,24 +104,26 @@ $internalDomains = $config.Email.InternalDomains
 $allowedExtensions = $config.Email.AllowedExtensions
 $minImageSize = if ($config.Email.MinImageSizeBytes) { $config.Email.MinImageSizeBytes } else { 30000 }
 
-# --- NEW CONFIG VARIABLES ---
 $testFromEnabled = $config.Email.TestFromEnabled
 $testFromAddress = $config.Email.TestFromAddress
 $keyWordExceptions = $config.Email.KeyWordExceptions
+$simulateSMB = $config.Paths.SimulateSMB
+
+# --- LOG FOLDER VERIFICATION ---
+if (-not (Test-Path -Path $config.Paths.LogFolder)) {
+    New-Item -ItemType Directory -Force -Path $config.Paths.LogFolder | Out-Null
+}
 
 try {
-    Write-Host "Connecting to Graph..." -ForegroundColor Cyan
+    Write-Log "Connecting to Graph API..." -Level "INFO" -Color "Cyan"
+    
     $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile($certPath, $keyPath)
     Connect-MgGraph -ClientId $clientId -TenantId $tenantId -Certificate $cert -NoWelcome
 
-    Write-Host "[GOOD] Connected. Fetching Inbox Messages..." -ForegroundColor Cyan
+    Write-Log "[GOOD] Connected to Graph successfully. Fetching Inbox Messages..." -Level "SUCCESS" -Color "Cyan"
 
-    # --- INBOX FILTERING LOGIC ---
-    # Deprecated: #$messages = Get-MgUserMailFolderMessage -UserId $targetMailbox -MailFolderId "Inbox" -Top 25 -Filter "hasAttachments eq true" -Select "id,subject,from,receivedDateTime,hasAttachments"
-    # Deprecated: $messages = Get-MgUserMailFolderMessage -UserId $targetMailbox -MailFolderId "Inbox" -all -Filter "from/emailAddress/address eq 'kroy@belltechlogix.com' and hasAttachments eq true" -Select "id,subject,from,receivedDateTime,hasAttachments"
-    
     if ($testFromEnabled -eq $true) {
-        Write-Host " [INFORMATIONAL] Test mode is ENABLED. Filtering only for emails from: $testFromAddress" -ForegroundColor Magenta
+        Write-Log " [INFORMATIONAL] Test mode is ENABLED. Filtering only for emails from: $testFromAddress" -Level "INFO" -Color "Magenta"
         $filterQuery = "from/emailAddress/address eq '$testFromAddress' and hasAttachments eq true"
     } else {
         $filterQuery = "hasAttachments eq true"
@@ -69,47 +132,41 @@ try {
     $messages = Get-MgUserMailFolderMessage -UserId $targetMailbox -MailFolderId "Inbox" -all -Filter $filterQuery -Select "id,subject,from,receivedDateTime,hasAttachments"
 
     if ($messages.Count -eq 0) {
-        Write-Host "[INFORMATIONAL] No new emails with attachments found." -ForegroundColor Yellow
+        Write-Log "[INFORMATIONAL] No new emails with attachments found." -Level "INFO" -Color "Yellow"
+    } else {
+        Write-Log "Found $($messages.Count) email(s) to process." -Level "INFO" -Color "Cyan"
     }
 
     # Loop through each message
     foreach ($msg in $messages) {
-        Write-Host "`n----------------------------------------"
+        # Generate short Message Correlation ID
+        $MsgID = if ($msg.Id.Length -ge 8) { $msg.Id.Substring($msg.Id.Length - 8) } else { "UNKNOWN" }
+        
+        Write-Host "`n----------------------------------------" -ForegroundColor White
         
         $senderEmail = $msg.From.EmailAddress.Address.ToLower()
         $senderDomain = ($senderEmail -split '@')[-1]
         
-        Write-Host "Processing Email: $($msg.Subject)" -ForegroundColor White
-        Write-Host "Sender Email:   $senderEmail" -ForegroundColor Gray
+        Write-Log "Processing Email: $($msg.Subject) | Sender: $senderEmail" -Level "INFO" -Color "White" -MsgID $MsgID
         
         # --- 0. STATEMENT & PAST DUE KILL SWITCH ---
-        # Deprecated: $killRegex = "(?i)(statement|statements|past due|past-due|pastdue)"
-        
-        # Dynamically build the Regex from the JSON array
         $escapedKeywords = $keyWordExceptions | ForEach-Object { [regex]::Escape($_) }
         $killRegex = "(?i)(" + ($escapedKeywords -join "|") + ")"
         
         $hasKillKeyword = $false
+        if ($msg.Subject -match $killRegex) { $hasKillKeyword = $true }
         
-        # Check Subject Line
-        if ($msg.Subject -match $killRegex) {
-            $hasKillKeyword = $true
-        }
-        
-        # Fetch attachments early so we can check their names for the kill words
         $attachments = Get-MgUserMessageAttachment -UserId $targetMailbox -MessageId $msg.Id -Select "id,name,contentType,size"
         
         if (-not $hasKillKeyword -and $attachments) {
             foreach ($att in $attachments) {
-                if ($att.Name -match $killRegex) {
-                    $hasKillKeyword = $true
-                    break
-                }
+                if ($att.Name -match $killRegex) { $hasKillKeyword = $true; break }
             }
         }
 
         if ($hasKillKeyword) {
-            Write-Host " [SKIP] Email contains Statement or Past Due keyword. Leaving untouched." -ForegroundColor Yellow
+            Write-Log " [SKIP] Email contains Statement or Past Due keyword. Leaving untouched." -Level "WARN" -Color "Yellow" -MsgID $MsgID
+            Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Untouched (Past Due or Statement)" -LogType "Runtime" -MsgID $MsgID
             continue
         }
 
@@ -121,79 +178,55 @@ try {
             $csvVendorMatch  = $row.'Email - Vendor Match'.Trim().ToLower()
             $csvDomain       = $row.'Domain'.Trim().ToLower()
 
-            # WATERFALL 1: Exact Email Match (Primary)
             if ($csvApVendorList -ne "" -and $senderEmail -eq $csvApVendorList) {
                 $supplierName = $row.'Supplier Name'
-                Write-Host " [GOOD] Matched via AP Vendor List -> $supplierName" -ForegroundColor Green
+                Write-Log " [GOOD] Matched via AP Vendor List -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                 break
             }
-            
-            # WATERFALL 2: Exact Email Match (Secondary)
-            # Was: if ($senderEmail -eq $csvMatchEmail) { ...
             if ($csvVendorMatch -ne "" -and $senderEmail -eq $csvVendorMatch) {
                 $supplierName = $row.'Supplier Name'
-                Write-Host " [GOOD] Matched via Vendor Match -> $supplierName" -ForegroundColor Green
+                Write-Log " [GOOD] Matched via Vendor Match -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                 break
             }
-            
-            # WATERFALL 3: Safe Domain Match
             if ($csvDomain -ne "" -and $senderDomain -eq $csvDomain -and $senderDomain -notin $genericDomains -and $senderDomain -notin $internalDomains) {
                 $supplierName = $row.'Supplier Name'
-                Write-Host " [GOOD] Matched via Corporate Domain -> $supplierName" -ForegroundColor Green
+                Write-Log " [GOOD] Matched via Corporate Domain -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                 break
             }
         }
 
-        # --- NEW EARLY FOLDER ROUTING (Needed for Collision Detection) ---
         if ($supplierName -eq "Unknown") {
-            Write-Host " [WARNING] No Match Found. Leaving email untouched in Inbox." -ForegroundColor Yellow
+            Write-Log " [WARNING] No Match Found. Leaving email untouched in Inbox." -Level "WARN" -Color "Yellow" -MsgID $MsgID
+            Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Untouched (Unknown Vendor)" -LogType "Runtime" -MsgID $MsgID
             continue 
         } else {
             $firstLetter = $supplierName.Substring(0,1).ToUpper()
-            if ($firstLetter -match "[A-Z]") {
-                $targetSubFolder = $firstLetter
-            } else {
-                $targetSubFolder = "#"
-            }
+            $targetSubFolder = if ($firstLetter -match "[A-Z]") { $firstLetter } else { "#" }
         }
         $finalSmbPath = Join-Path $config.Paths.SMBDestination $targetSubFolder
 
         # --- 2. ATTACHMENT INSPECTION & RENAMING BLOCK ---
-        # Deprecated: $attachments = Get-MgUserMessageAttachment -UserId $targetMailbox -MessageId $msg.Id -Select "id,name,contentType,size"
-        # (Attachments are now fetched in Step 0)
-        
         $validAttachments = @()
+        $filesToMove = @()
+        $processedFileNames = @()
         $dateStamp = Get-Date -Format "yyyyMMdd"
 
         if ($attachments) {
             foreach ($att in $attachments) {
                 $ext = [System.IO.Path]::GetExtension($att.Name).ToLower()
-                
                 if ($ext -in $allowedExtensions) {
-                    
-                    # --- IMAGE SIZE GATE ---
-                    $isImage = $ext -match "\.(jpg|jpeg|png|gif|bmp|tif|tiff)$"
-                    if ($isImage -and $att.Size -lt $minImageSize) {
-                        Write-Host "  -> [SKIP] Ignored Tiny Image (Likely Signature, $($att.Size) bytes): $($att.Name)" -ForegroundColor DarkGray
+                    if ($ext -match "\.(jpg|jpeg|png|gif|bmp|tif|tiff)$" -and $att.Size -lt $minImageSize) {
+                        Write-Log "  -> [SKIP] Ignored Tiny Image: $($att.Name)" -Level "INFO" -Color "DarkGray" -MsgID $MsgID
                         continue
                     }
-                    # -----------------------
 
-                    Write-Host "  -> [KEEP] Found Invoice: $($att.Name)" -ForegroundColor Green
-                    
-                    # --- HYBRID FILE NAMING & COLLISION DETECTION ---
-                    # Deprecated: $newFileName = Format-InvoiceName -SupplierName $supplierName -OriginalFileName $att.Name
+                    Write-Log "  -> [KEEP] Found Invoice: $($att.Name)" -Level "INFO" -Color "Green" -MsgID $MsgID
                     
                     $nameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($att.Name)
-                    $cleanSupplier = $supplierName -replace '[^a-zA-Z0-9\s\-]', ''
-                    $cleanSupplier = ($cleanSupplier -replace '\s+', '-') -replace '\-+', '-'
-                    $cleanSupplier = $cleanSupplier.TrimEnd('-')
-                    
-                    # Base Name: Vendor Name - Date Stamp - OriginalFileName
+                    $cleanSupplier = ($supplierName -replace '[^a-zA-Z0-9\s\-]', '' -replace '\s+', '-').TrimEnd('-')
                     $baseName = "$cleanSupplier-$dateStamp-$nameWithoutExt"
-                    $counter = 0
                     
-                    # Check SMB destination to see if a PDF with this name already exists
+                    $counter = 0
                     $finalPdfName = "$baseName.pdf"
                     while (Test-Path (Join-Path $finalSmbPath $finalPdfName)) {
                         $counter++
@@ -201,121 +234,119 @@ try {
                         $finalPdfName = "$baseName($paddedCounter).pdf"
                     }
                     
-                    # Apply the generated suffix to the staging file so it retains its native extension for conversion
-                    if ($counter -eq 0) {
-                        $newFileName = "$baseName$ext"
-                    } else {
-                        $newFileName = "$baseName($paddedCounter)$ext"
-                    }
+                    $newFileName = if ($counter -eq 0) { "$baseName$ext" } else { "$baseName($paddedCounter)$ext" }
+                    Write-Log "  -> [RENAMING] New Invoice Name: $newFileName" -Level "INFO" -Color "Magenta" -MsgID $MsgID
                     
-                    Write-Host "  -> [RENAMING] New Invoice Name: $newFileName" -ForegroundColor Magenta
-                    # ------------------------------------------------
-                    
-                    # --- DOWNLOAD & CONVERSION ENGINE ---
                     $stagingPath = Join-Path $config.Paths.Staging $newFileName
-                    Write-Host "  -> [DOWNLOADING] Fetching file data to Staging..." -ForegroundColor Cyan
-                    
                     try {
-                        ## 1. Download the raw file via direct request (bypasses the SDK type-casting bug)
+                        Write-Log "  -> [DOWNLOADING] Fetching file data to Staging..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
                         $uri = "https://graph.microsoft.com/v1.0/users/$targetMailbox/messages/$($msg.Id)/attachments/$($att.Id)"
                         $rawAttachment = Invoke-MgGraphRequest -Method GET -Uri $uri
-
-                        # Convert the raw Base64 data back into actual file bytes
-                        $fileBytes = [System.Convert]::FromBase64String($rawAttachment.contentBytes)
-
-                        # Save to Staging
-                        [System.IO.File]::WriteAllBytes($stagingPath, $fileBytes)
-                        Write-Host "  -> [GOOD] File saved to Staging: $stagingPath" -ForegroundColor Green
+                        [System.IO.File]::WriteAllBytes($stagingPath, [System.Convert]::FromBase64String($rawAttachment.contentBytes))
                         
-                        # 2. LibreOffice Conversion for Docs and Sheets
                         if ($ext -match "\.(docx|doc|xlsx|xls|csv)$") {
-                            Write-Host "  -> [CONVERTING] Running LibreOffice Headless on $ext..." -ForegroundColor Cyan
+                            Write-Log "  -> [CONVERTING] Running LibreOffice Headless on $ext..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
                             $process = Start-Process -FilePath "libreoffice" -ArgumentList "--headless", "--convert-to", "pdf", "`"$stagingPath`"", "--outdir", "`"$($config.Paths.Staging)`"" -Wait -PassThru
-                            
                             if ($process.ExitCode -eq 0) {
-                                Write-Host "  -> [GOOD] Document successfully converted to PDF!" -ForegroundColor Green
-                                # CLEANUP: Delete original raw file
+                                Write-Log "  -> [GOOD] Document successfully converted to PDF!" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                                 Remove-Item -Path $stagingPath -Force
-                                Write-Host "  -> [CLEANUP] Deleted original raw file: $newFileName" -ForegroundColor DarkGray
-                            } else {
-                                Write-Host "  -> [FAIL] LibreOffice conversion failed (Exit Code: $($process.ExitCode))" -ForegroundColor Red
+                                $filesToMove += [System.IO.Path]::ChangeExtension($stagingPath, ".pdf")
+                                $processedFileNames += $finalPdfName
                             }
                         }
-                        # 3. img2pdf Conversion for Images
                         elseif ($ext -match "\.(jpg|jpeg)$") {
-                            Write-Host "  -> [CONVERTING] Running img2pdf on $ext..." -ForegroundColor Cyan
+                            Write-Log "  -> [CONVERTING] Running img2pdf on $ext..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
                             $convertedPdfPath = [System.IO.Path]::ChangeExtension($stagingPath, ".pdf")
-                            
                             $process = Start-Process -FilePath "img2pdf" -ArgumentList "`"$stagingPath`"", "-o", "`"$convertedPdfPath`"" -Wait -PassThru
-                            
                             if ($process.ExitCode -eq 0) {
-                                Write-Host "  -> [GOOD] Image successfully converted to PDF!" -ForegroundColor Green
-                                # CLEANUP: Delete original raw file
+                                Write-Log "  -> [GOOD] Image successfully converted to PDF!" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                                 Remove-Item -Path $stagingPath -Force
-                                Write-Host "  -> [CLEANUP] Deleted original raw file: $newFileName" -ForegroundColor DarkGray
-                            } else {
-                                Write-Host "  -> [FAIL] img2pdf conversion failed (Exit Code: $($process.ExitCode))" -ForegroundColor Red
+                                $filesToMove += $convertedPdfPath
+                                $processedFileNames += $finalPdfName
                             }
                         }
-
+                        elseif ($ext -eq ".pdf") {
+                            $filesToMove += $stagingPath
+                            $processedFileNames += $finalPdfName
+                        }
                         $validAttachments += $att
                     } catch {
-                        Write-Host "  -> [FAIL] Could not save or process file. Error: $($_.Exception.Message)" -ForegroundColor Red
+                        $errInfo = if ($config.Logging.Verbose) { "$($_.Exception.Message) (Line: $($_.InvocationInfo.ScriptLineNumber))" } else { $_.Exception.Message }
+                        Write-Log "  -> [FAIL] Attachment Process Failed: $errInfo" -Level "ERROR" -Color "Red" -MsgID $MsgID
                     }
-                    # ------------------------------------
-
-                } else {
-                    Write-Host "  -> [SKIP] Ignored Junk File: $($att.Name)" -ForegroundColor DarkGray
                 }
             }
         }
 
         if ($validAttachments.Count -eq 0) {
-            Write-Host " [WARNING] No valid invoice files found. Skipping email." -ForegroundColor Yellow
             continue 
         }
 
         # --- 3. FOLDER ROUTING LOGIC ---
-        # <--- OLD ROUTING LOGIC DEPRECATED (Moved to Step 1 for Collision Support) --->
-        # if ($supplierName -eq "Unknown") {
-        #     Write-Host " [WARNING] No Match Found. Routing to Exceptions." -ForegroundColor Yellow
-        #     $targetSubFolder = "Exceptions"
-        # } else {
-        #     $firstLetter = $supplierName.Substring(0,1).ToUpper()
-        #     if ($firstLetter -match "[A-Z]") {
-        #         $targetSubFolder = $firstLetter
-        #     } else {
-        #         $targetSubFolder = "#"
-        #     }
-        # }
-        # $finalSmbPath = Join-Path $config.Paths.SMBDestination $targetSubFolder
+        Write-Log " Routing $($validAttachments.Count) file(s) to SMB Folder: $finalSmbPath" -Level "INFO" -Color "Cyan" -MsgID $MsgID
         
-        Write-Host " Routing $($validAttachments.Count) file(s) to SMB Folder: $finalSmbPath" -ForegroundColor Cyan
-        
-        # --- SIMULATE ACCESS (READ-ONLY TEST) ---
-        if (Test-Path -Path $finalSmbPath) {
-            Write-Host "   [GOOD] Folder Exists on SMB Share." -ForegroundColor Green
-            try {
-                $itemCount = (Get-ChildItem -Path $finalSmbPath -ErrorAction Stop).Count
-                Write-Host "   [INFORMATIONAL] Successfully opened folder. It currently contains $itemCount items." -ForegroundColor DarkGray
-            } 
-            catch {
-                Write-Host "   [FAIL] Folder exists, but READ ACCESS DENIED." -ForegroundColor Red
-                Write-Host "       Error: $($_.Exception.Message)" -ForegroundColor DarkRed
+        if ($simulateSMB -eq $true) {
+            if (Test-Path -Path $finalSmbPath) {
+                Write-Log "   [GOOD] Folder Exists on SMB Share." -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+                Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Processed (Simulation) - Attachments renamed to `"$($processedFileNames -join '", "')`" placed in folder `"$finalSmbPath`"" -LogType "Runtime" -MsgID $MsgID
+            } else {
+                Write-Log "   [FAIL] SMB Target Folder DOES NOT EXIST ($finalSmbPath)" -Level "ERROR" -Color "Red" -MsgID $MsgID
             }
-        } 
-        else {
-            Write-Host "   [FAIL] Folder DOES NOT EXIST ($finalSmbPath)" -ForegroundColor Red
+        } else {
+            if (Test-Path -Path $finalSmbPath) {
+                foreach ($file in $filesToMove) {
+                    try { 
+                        Move-Item -Path $file -Destination $finalSmbPath -Force 
+                        Write-Log "   -> [MOVED] Successfully moved to SMB: $(Split-Path $file -Leaf)" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+                    } catch { 
+                        Write-Log "   -> [FAIL] Move Failed: $($_.Exception.Message)" -Level "ERROR" -Color "Red" -MsgID $MsgID
+                    }
+                }
+                Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Processed - Attachments renamed to `"$($processedFileNames -join '", "')`" placed in folder `"$finalSmbPath`"" -LogType "Runtime" -MsgID $MsgID
+            } else {
+                Write-Log "   [FAIL] Target SMB Folder DOES NOT EXIST ($finalSmbPath). Files left in Staging." -Level "ERROR" -Color "Red" -MsgID $MsgID
+            }
         }
     }
 }
 catch {
-    Write-Host "[FAIL] CRITICAL ERROR" -ForegroundColor Red
-    Write-Host $_.Exception.Message -ForegroundColor Yellow
+    $errInfo = if ($config.Logging.Verbose) { "$($_.Exception.Message) (Line: $($_.InvocationInfo.ScriptLineNumber))" } else { $_.Exception.Message }
+    Write-Log "[FAIL] CRITICAL ERROR: $errInfo" -Level "ERROR" -Color "Red"
 }
 finally {
     if (Get-MgContext) { 
         Disconnect-MgGraph | Out-Null 
-        Write-Host "`n[INFORMATIONAL] Disconnected from Graph." -ForegroundColor DarkGray
+        Write-Log "`n[INFORMATIONAL] Disconnected from Graph API." -Level "INFO" -Color "DarkGray"
+    }
+
+    # --- FINAL CIRCULAR LOG CLEANUP (Bulk End-of-Run Trim) ---
+    if ($config.Logging.Circular -eq $true) {
+        $logPaths = @($config.Paths.Runtime_Log, $config.Paths.Error_Log)
+        
+        $sizeString = $config.Logging.Log_Size.ToUpper()
+        $maxSizeBytes = 50MB
+        if ($sizeString -match "(\d+)\s*MB") { $maxSizeBytes = [int]$matches[1] * 1MB }
+
+        foreach ($logPath in $logPaths) {
+            if (Test-Path $logPath) {
+                $currentSize = (Get-Item $logPath).Length
+                if ($currentSize -gt $maxSizeBytes) {
+                    Write-Log "[CLEANUP] Log file $logPath exceeds limit ($([math]::Round($currentSize / 1MB, 2)) MB). Trimming..." -Level "INFO" -Color "Gray"
+                    
+                    # Read the log and determine how many entries (lines) to delete proportionally
+                    $allLines = Get-Content $logPath
+                    $totalLines = $allLines.Count
+                    
+                    # Proportional Calculation: If we are 20% over size, remove 20% of lines
+                    $percentageOver = ($currentSize - $maxSizeBytes) / $currentSize
+                    $linesToDelete = [math]::Ceiling($totalLines * $percentageOver)
+                    
+                    if ($linesToDelete -lt $totalLines) {
+                        $allLines[$linesToDelete..($totalLines - 1)] | Set-Content $logPath
+                        Write-Log "Log maintenance performed: Removed $linesToDelete oldest entries to maintain $sizeString limit." -Level "INFO" -Color "Gray"
+                    }
+                }
+            }
+        }
     }
 }
