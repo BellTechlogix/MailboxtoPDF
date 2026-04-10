@@ -4,7 +4,7 @@
     Created On - 2026-03-20
     Revised On - 2026-04-10
     Revised On - 2026-03-20 (Descriptive Comments Added)
-    Modules Required: Microsoft.Graph.Authentication, Microsoft.Graph.Users
+    Modules Required: Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Mail
 
     .Important
     - EXECUTION ENVIRONMENT: This script is hardcoded for Linux paths (/opt/ap-automation/). 
@@ -25,9 +25,10 @@
     5. Routes files to a tiered SMB directory structure based on vendor naming.
     6. Added logging functionality: Circular (Bulk end-of-run trim), Verbose, Error, and Runtime history tracking.
        Includes Dual-pipe abstraction, correlation IDs, and global error trapping.
+    7. Added Mailbox Routing: Marks emails as read and moves them to fuzzy-matched Inbox subfolders (e.g., "A - Invoices").
 
     .VERSION
-    1.4
+    1.5
 
     .NOTES
     - Explicit regex sanitization is used for vendor names to prevent directory traversal.
@@ -108,6 +109,7 @@ $testFromEnabled = $config.Email.TestFromEnabled
 $testFromAddress = $config.Email.TestFromAddress
 $keyWordExceptions = $config.Email.KeyWordExceptions
 $simulateSMB = $config.Paths.SimulateSMB
+$simulateMove = $config.Email.SimulateMove
 
 # --- LOG FOLDER VERIFICATION ---
 if (-not (Test-Path -Path $config.Paths.LogFolder)) {
@@ -135,6 +137,15 @@ try {
         Write-Log "[INFORMATIONAL] No new emails with attachments found." -Level "INFO" -Color "Yellow"
     } else {
         Write-Log "Found $($messages.Count) email(s) to process." -Level "INFO" -Color "Cyan"
+        
+        # Pre-cache Inbox Subfolders for routing later
+        try {
+            Write-Log "Caching Inbox subfolders for Mailbox Routing..." -Level "INFO" -Color "DarkGray"
+            $inboxSubfolders = Get-MgUserMailFolderChildFolder -UserId $targetMailbox -MailFolderId "Inbox" -All
+        } catch {
+            Write-Log "Failed to cache Inbox subfolders. Mailbox Routing may fail: $($_.Exception.Message)" -Level "WARN" -Color "Yellow"
+            $inboxSubfolders = @()
+        }
     }
 
     # Loop through each message
@@ -142,7 +153,7 @@ try {
         # Generate short Message Correlation ID
         $MsgID = if ($msg.Id.Length -ge 8) { $msg.Id.Substring($msg.Id.Length - 8) } else { "UNKNOWN" }
         
-        Write-Host "`n----------------------------------------" -ForegroundColor White
+        Write-Log "`n----------------------------------------" -Level "INFO" -Color "White" -MsgID $MsgID
         
         $senderEmail = $msg.From.EmailAddress.Address.ToLower()
         $senderDomain = ($senderEmail -split '@')[-1]
@@ -282,7 +293,7 @@ try {
             continue 
         }
 
-        # --- 3. FOLDER ROUTING LOGIC ---
+        # --- 3. SMB FOLDER ROUTING LOGIC ---
         Write-Log " Routing $($validAttachments.Count) file(s) to SMB Folder: $finalSmbPath" -Level "INFO" -Color "Cyan" -MsgID $MsgID
         
         if ($simulateSMB -eq $true) {
@@ -305,6 +316,27 @@ try {
                 Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Processed - Attachments renamed to `"$($processedFileNames -join '", "')`" placed in folder `"$finalSmbPath`"" -LogType "Runtime" -MsgID $MsgID
             } else {
                 Write-Log "   [FAIL] Target SMB Folder DOES NOT EXIST ($finalSmbPath). Files left in Staging." -Level "ERROR" -Color "Red" -MsgID $MsgID
+            }
+        }
+
+        # --- 4. MAILBOX ROUTING LOGIC (Read & Move) ---
+        if ($simulateMove -eq $true) {
+            Write-Log "   [SIMULATION] SimulateMove is TRUE. Email left unread and untouched in Inbox." -Level "INFO" -Color "DarkGray" -MsgID $MsgID
+        } else {
+            # Fuzzy match folder names like "A - Invoices", "A- Invoices", "A -Invoices", etc.
+            $expectedPattern = "(?i)^$targetSubFolder\s*-\s*Invoices$"
+            $targetMailFolder = $inboxSubfolders | Where-Object { $_.DisplayName -match $expectedPattern } | Select-Object -First 1
+
+            if ($null -ne $targetMailFolder) {
+                try {
+                    Update-MgUserMessage -UserId $targetMailbox -MessageId $msg.Id -IsRead $true -ErrorAction Stop | Out-Null
+                    Move-MgUserMessage -UserId $targetMailbox -MessageId $msg.Id -DestinationId $targetMailFolder.Id -ErrorAction Stop | Out-Null
+                    Write-Log "   [MOVED] Email marked as read and moved to mailbox folder: $($targetMailFolder.DisplayName)" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+                } catch {
+                    Write-Log "   [FAIL] Failed to update/move email in mailbox: $($_.Exception.Message)" -Level "ERROR" -Color "Red" -MsgID $MsgID
+                }
+            } else {
+                Write-Log "   [WARN] Target mailbox folder matching '$targetSubFolder - Invoices' not found in Inbox. Email left untouched." -Level "WARN" -Color "Yellow" -MsgID $MsgID
             }
         }
     }
