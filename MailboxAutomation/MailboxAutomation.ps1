@@ -1,10 +1,10 @@
-﻿<#
+<#
     MailboxAutomation.ps1
     Created By - Kristopher Roy
     Created On - 2026-03-20
-    Revised On - 2026-04-10
-    Revised On - 2026-03-20 (Descriptive Comments Added)
-    Modules Required: Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Mail
+    Revised On - 2026-04-13
+    Revised On - 2026-04-13 (Descriptive Comments Added)
+    Modules Required: Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Mail, ImportExcel
 
     .Important
     - EXECUTION ENVIRONMENT: This script is hardcoded for Linux paths (/opt/ap-automation/). 
@@ -25,22 +25,16 @@
     5. Routes files to a tiered SMB directory structure based on vendor naming.
     6. Added logging functionality: Circular (Bulk end-of-run trim), Verbose, Error, and Runtime history tracking.
        Includes Dual-pipe abstraction, correlation IDs, and global error trapping.
-    7. Added Mailbox Routing: Marks emails as read and moves them to fuzzy-matched Inbox subfolders (e.g., "A - Invoices").
+    7. Added Mailbox Routing: Marks emails as read and moves them from the Inbox to fuzzy-matched top-level mailbox folders (e.g., root "A - Invoices").
 
     .VERSION
-    1.5
+    1.8
 
     .NOTES
     - Explicit regex sanitization is used for vendor names to prevent directory traversal.
     - Collision detection (suffixing files with (01), (02)) prevents overwriting 
       existing invoices on the SMB share.
 #>
-
-# ------
-# 1. PATH DEPENDENCY: Script assumes /opt/ap-automation/ presence. Mitigation: Verify volume mounts in container/host.
-# 2. EXTERNAL BINARIES: 'libreoffice' and 'img2pdf' failures are caught but will skip file conversion.
-# 3. GRAPH SDK BUG: Uses Invoke-MgGraphRequest for attachments to bypass known Base64 casting issues in Mg-UserMessageAttachment.
-# 4. DATA INTEGRITY: Mapping CSV must have specific headers: 'Email - AP Vendor List', 'Email - Vendor Match', 'Domain', 'Supplier Name'.
 
 # --- GLOBAL ERROR TRAP & RUN IDENTITY ---
 $ErrorActionPreference = "Stop" # Prevents silent failures
@@ -58,7 +52,6 @@ function Write-Log {
     )
 
     # --- 1. CONSOLE OUTPUT (The Dual Pipe) ---
-    # Only print to screen if it's the Error/Verbose log (Runtime log is for files only)
     if ($LogType -ne "Runtime") {
         Write-Host $Message -ForegroundColor $Color
     }
@@ -88,6 +81,50 @@ function Format-InvoiceName {
     $cleanSupplier = ($cleanSupplier -replace '\s+', '-') -replace '\-+', '-'
     $cleanSupplier = $cleanSupplier.TrimEnd('-')
     return "$cleanSupplier-$OriginalFileName"
+}
+
+# --- NEW EXCEL FORMATTING FUNCTION ---
+function Format-ExcelForPdf {
+    param (
+        [string]$FilePath,
+        [string]$MsgID = "SYS"
+    )
+    
+    try {
+        # EXPLICITLY LOAD THE MODULE FIRST
+        Import-Module ImportExcel -ErrorAction Stop
+        
+        Write-Log "  -> [FORMATTING] Adjusting Excel print settings (Landscape, Fit-to-Width)..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
+        
+        # Open the Excel file in memory
+        $pkg = Open-ExcelPackage -Path $FilePath
+        
+        # Loop through every sheet (tab) in the workbook
+        foreach ($ws in $pkg.Workbook.Worksheets) {
+            
+            # Force the page orientation to Landscape
+            $ws.PrinterSettings.Orientation = [OfficeOpenXml.eOrientation]::Landscape
+            
+            # Turn on the "Fit to Page" toggle
+            $ws.PrinterSettings.FitToPage = $true
+            
+            # Constrain width to 1 page, but let height be unlimited (0)
+            $ws.PrinterSettings.FitToWidth = 1
+            $ws.PrinterSettings.FitToHeight = 0
+            
+            # Shrink the margins to give data more room
+            $ws.PrinterSettings.LeftMargin = 0.25
+            $ws.PrinterSettings.RightMargin = 0.25
+        }
+        
+        # Save the changes back to the physical file and close it
+        Close-ExcelPackage -ExcelPackage $pkg
+        
+        Write-Log "  -> [GOOD] Excel file pre-formatted successfully." -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+    } catch {
+        # If it fails, we throw a warning but let LibreOffice try its best anyway
+        Write-Log "  -> [WARN] Failed to pre-format Excel file: $($_.Exception.Message)" -Level "WARN" -Color "Yellow" -MsgID $MsgID
+    }
 }
 
 # --- INITIALIZATION of CONFIG FILE---
@@ -138,13 +175,13 @@ try {
     } else {
         Write-Log "Found $($messages.Count) email(s) to process." -Level "INFO" -Color "Cyan"
         
-        # Pre-cache Inbox Subfolders for routing later
+        # Pre-cache Top-Level Mailbox Folders for routing later
         try {
-            Write-Log "Caching Inbox subfolders for Mailbox Routing..." -Level "INFO" -Color "DarkGray"
-            $inboxSubfolders = Get-MgUserMailFolderChildFolder -UserId $targetMailbox -MailFolderId "Inbox" -All
+            Write-Log "Caching Top-Level Mailbox folders for Routing..." -Level "INFO" -Color "DarkGray"
+            $mailboxFolders = Get-MgUserMailFolder -UserId $targetMailbox -All
         } catch {
-            Write-Log "Failed to cache Inbox subfolders. Mailbox Routing may fail: $($_.Exception.Message)" -Level "WARN" -Color "Yellow"
-            $inboxSubfolders = @()
+            Write-Log "Failed to cache mailbox folders. Mailbox Routing may fail: $($_.Exception.Message)" -Level "WARN" -Color "Yellow"
+            $mailboxFolders = @()
         }
     }
 
@@ -211,10 +248,31 @@ try {
             Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Untouched (Unknown Vendor)" -LogType "Runtime" -MsgID $MsgID
             continue 
         } else {
+            # --- OLD SIMPLE FOLDER LOGIC (COMMENTED OUT) ---
+            # $firstLetter = $supplierName.Substring(0,1).ToUpper()
+            # $targetSubFolder = if ($firstLetter -match "[A-Z]") { $firstLetter } else { "#" }
+            # $finalSmbPath = Join-Path $config.Paths.SMBDestination $targetSubFolder
+            # -----------------------------------------------
+
+            # --- NEW SYNCHRONIZED FOLDER LOGIC (v1.8) ---
             $firstLetter = $supplierName.Substring(0,1).ToUpper()
             $targetSubFolder = if ($firstLetter -match "[A-Z]") { $firstLetter } else { "#" }
+            $expectedPattern = "(?i)^$targetSubFolder\s*-\s*Invoices$"
+
+            # 1. Resolve SMB Path (Discover actual folder name on share like 'A - Invoices')
+            try {
+                $matchedSmbDir = Get-ChildItem -Path $config.Paths.SMBDestination -Directory -ErrorAction SilentlyContinue | 
+                                 Where-Object { $_.Name -match $expectedPattern } | Select-Object -First 1
+                
+                $finalSmbPath = if ($matchedSmbDir) { $matchedSmbDir.FullName } else { Join-Path $config.Paths.SMBDestination $targetSubFolder }
+            } catch {
+                $finalSmbPath = Join-Path $config.Paths.SMBDestination $targetSubFolder
+            }
+
+            # 2. Resolve Mailbox Folder (Identify matching root-level Outlook folder)
+            $targetMailFolder = $mailboxFolders | Where-Object { $_.DisplayName -match $expectedPattern } | Select-Object -First 1
+            # ---------------------------------------------
         }
-        $finalSmbPath = Join-Path $config.Paths.SMBDestination $targetSubFolder
 
         # --- 2. ATTACHMENT INSPECTION & RENAMING BLOCK ---
         $validAttachments = @()
@@ -256,6 +314,13 @@ try {
                         [System.IO.File]::WriteAllBytes($stagingPath, [System.Convert]::FromBase64String($rawAttachment.contentBytes))
                         
                         if ($ext -match "\.(docx|doc|xlsx|xls|csv)$") {
+                            
+                            # --- INTERCEPT: FORMAT EXCEL FILES ---
+                            if ($ext -match "\.(xlsx|xls)$") {
+                                Format-ExcelForPdf -FilePath $stagingPath -MsgID $MsgID
+                            }
+                            # -------------------------------------
+
                             Write-Log "  -> [CONVERTING] Running LibreOffice Headless on $ext..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
                             $process = Start-Process -FilePath "libreoffice" -ArgumentList "--headless", "--convert-to", "pdf", "`"$stagingPath`"", "--outdir", "`"$($config.Paths.Staging)`"" -Wait -PassThru
                             if ($process.ExitCode -eq 0) {
@@ -321,22 +386,31 @@ try {
 
         # --- 4. MAILBOX ROUTING LOGIC (Read & Move) ---
         if ($simulateMove -eq $true) {
-            Write-Log "   [SIMULATION] SimulateMove is TRUE. Email left unread and untouched in Inbox." -Level "INFO" -Color "DarkGray" -MsgID $MsgID
+            # --- UPGRADED SIMULATION FEEDBACK ---
+            if ($null -ne $targetMailFolder) {
+                Write-Log "   [SIMULATION] Target mailbox folder found! Would move to: '$($targetMailFolder.DisplayName)'." -Level "INFO" -Color "Magenta" -MsgID $MsgID
+            } else {
+                Write-Log "   [SIMULATION WARNING] Target folder '$targetSubFolder - Invoices' NOT FOUND at Root." -Level "WARN" -Color "Yellow" -MsgID $MsgID
+            }
+            Write-Log "   [SIMULATION] Email left unread and untouched in Inbox." -Level "INFO" -Color "DarkGray" -MsgID $MsgID
+            # ------------------------------------
         } else {
+            # --- OLD FOLDER DISCOVERY (MOVED TO TOP IN v1.6) ---
             # Fuzzy match folder names like "A - Invoices", "A- Invoices", "A -Invoices", etc.
-            $expectedPattern = "(?i)^$targetSubFolder\s*-\s*Invoices$"
-            $targetMailFolder = $inboxSubfolders | Where-Object { $_.DisplayName -match $expectedPattern } | Select-Object -First 1
+            # $expectedPattern = "(?i)^$targetSubFolder\s*-\s*Invoices$"
+            # $targetMailFolder = $inboxSubfolders | Where-Object { $_.DisplayName -match $expectedPattern } | Select-Object -First 1
+            # ---------------------------------------------------
 
             if ($null -ne $targetMailFolder) {
                 try {
-                    Update-MgUserMessage -UserId $targetMailbox -MessageId $msg.Id -IsRead $true -ErrorAction Stop | Out-Null
+                    Update-MgUserMessage -UserId $targetMailbox -MessageId $msg.Id -IsRead -ErrorAction Stop | Out-Null
                     Move-MgUserMessage -UserId $targetMailbox -MessageId $msg.Id -DestinationId $targetMailFolder.Id -ErrorAction Stop | Out-Null
                     Write-Log "   [MOVED] Email marked as read and moved to mailbox folder: $($targetMailFolder.DisplayName)" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                 } catch {
                     Write-Log "   [FAIL] Failed to update/move email in mailbox: $($_.Exception.Message)" -Level "ERROR" -Color "Red" -MsgID $MsgID
                 }
             } else {
-                Write-Log "   [WARN] Target mailbox folder matching '$targetSubFolder - Invoices' not found in Inbox. Email left untouched." -Level "WARN" -Color "Yellow" -MsgID $MsgID
+                Write-Log "   [WARN] Target mailbox folder matching '$targetSubFolder - Invoices' not found at Root. Email left untouched." -Level "WARN" -Color "Yellow" -MsgID $MsgID
             }
         }
     }
