@@ -2,8 +2,8 @@
     MailboxAutomation.ps1
     Created By - Kristopher Roy
     Created On - 2026-03-20
-    Revised On - 2026-04-13
-    Revised On - 2026-04-13 (Descriptive Comments Added)
+    Revised On - 2026-04-14
+    Revised On - 2026-04-14 (Descriptive Comments Added)
     Modules Required: Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Mail, ImportExcel
 
     .Important
@@ -28,7 +28,7 @@
     7. Added Mailbox Routing: Marks emails as read and moves them from the Inbox to fuzzy-matched top-level mailbox folders (e.g., root "A - Invoices").
 
     .VERSION
-    1.8
+    1.11
 
     .NOTES
     - Explicit regex sanitization is used for vendor names to prevent directory traversal.
@@ -165,7 +165,7 @@ try {
         Write-Log " [INFORMATIONAL] Test mode is ENABLED. Filtering only for emails from: $testFromAddress" -Level "INFO" -Color "Magenta"
         $filterQuery = "from/emailAddress/address eq '$testFromAddress' and hasAttachments eq true"
     } else {
-        $filterQuery = "hasAttachments eq true"
+        $filterQuery = "isRead eq false and hasAttachments eq true"
     }
     
     $messages = Get-MgUserMailFolderMessage -UserId $targetMailbox -MailFolderId "Inbox" -all -Filter $filterQuery -Select "id,subject,from,receivedDateTime,hasAttachments"
@@ -194,6 +194,7 @@ try {
         
         $senderEmail = $msg.From.EmailAddress.Address.ToLower()
         $senderDomain = ($senderEmail -split '@')[-1]
+        $senderDisplayName = $msg.From.EmailAddress.Name
         
         Write-Log "Processing Email: $($msg.Subject) | Sender: $senderEmail" -Level "INFO" -Color "White" -MsgID $MsgID
         
@@ -202,64 +203,95 @@ try {
         $killRegex = "(?i)(" + ($escapedKeywords -join "|") + ")"
         
         $hasKillKeyword = $false
-        if ($msg.Subject -match $killRegex) { $hasKillKeyword = $true }
+        $matchedWord = ""
+        
+        if ($msg.Subject -match $killRegex) { 
+            $hasKillKeyword = $true 
+            $matchedWord = $matches[0]
+        }
         
         $attachments = Get-MgUserMessageAttachment -UserId $targetMailbox -MessageId $msg.Id -Select "id,name,contentType,size"
         
         if (-not $hasKillKeyword -and $attachments) {
             foreach ($att in $attachments) {
-                if ($att.Name -match $killRegex) { $hasKillKeyword = $true; break }
+                if ($att.Name -match $killRegex) { 
+                    $hasKillKeyword = $true
+                    $matchedWord = $matches[0]
+                    break 
+                }
             }
         }
 
         if ($hasKillKeyword) {
-            Write-Log " [SKIP] Email contains Statement or Past Due keyword. Leaving untouched." -Level "WARN" -Color "Yellow" -MsgID $MsgID
-            Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Untouched (Past Due or Statement)" -LogType "Runtime" -MsgID $MsgID
+            # Injecting the senderEmail and the exact matched word into the Warning string
+            Write-Log " [SKIP] Email from '$senderEmail' contains the keyword '$matchedWord'. Leaving untouched." -Level "WARN" -Color "Yellow" -MsgID $MsgID
+            Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Untouched (Keyword: $matchedWord)" -LogType "Runtime" -MsgID $MsgID
             continue
         }
 
         # --- 1. THE WATERFALL MATCHING LOGIC ---
         $supplierName = "Unknown"
+        $fallbackSupplier = "Unknown"
+        Write-Host ">>> DEBUG: The raw Display Name PowerShell sees is: '$senderDisplayName'" -ForegroundColor Magenta
 
         foreach ($row in $mapping) {
-            $csvApVendorList = $row.'Email - AP Vendor List'.Trim().ToLower()
-            $csvVendorMatch  = $row.'Email - Vendor Match'.Trim().ToLower()
-            $csvDomain       = $row.'Domain'.Trim().ToLower()
+            # Wrapping the row calls in "$()" prevents the "null-valued expression" crash if a column is missing or a cell is empty
+            $csvApVendorList = "$($row.'Email - AP Vendor List')".Trim().ToLower()
+            $csvVendorMatch  = "$($row.'Email - Vendor Match')".Trim().ToLower()
+            $csvDomain       = "$($row.'Domain')".Trim().ToLower()
+            $csvSupplierName = "$($row.'Supplier Name')".Trim()
 
             if ($csvApVendorList -ne "" -and $senderEmail -eq $csvApVendorList) {
-                $supplierName = $row.'Supplier Name'
+                $supplierName = $csvSupplierName
                 Write-Log " [GOOD] Matched via AP Vendor List -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                 break
             }
             if ($csvVendorMatch -ne "" -and $senderEmail -eq $csvVendorMatch) {
-                $supplierName = $row.'Supplier Name'
+                $supplierName = $csvSupplierName
                 Write-Log " [GOOD] Matched via Vendor Match -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                 break
             }
-            if ($csvDomain -ne "" -and $senderDomain -eq $csvDomain -and $senderDomain -notin $genericDomains -and $senderDomain -notin $internalDomains) {
-                $supplierName = $row.'Supplier Name'
-                Write-Log " [GOOD] Matched via Corporate Domain -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+            if (($csvSupplierName -ne "" -and $senderDisplayName -match [regex]::Escape($csvSupplierName)) -or ($csvApVendorList -ne "" -and $senderDisplayName -match [regex]::Escape($csvApVendorList))) {
+                $supplierName = $csvSupplierName
+                Write-Log " [GOOD] Matched via Display Name Tag -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                 break
+            }
+            if ($fallbackSupplier -eq "Unknown" -and $csvDomain -ne "" -and $senderDomain -eq $csvDomain -and $senderDomain -notin $genericDomains -and $senderDomain -notin $internalDomains) {
+                # Store the domain match as a fallback, but continue the loop to check for exact email matches
+                $fallbackSupplier = $csvSupplierName
             }
         }
 
+        # Final check: If no Tier 1 or Tier 2 match was found, use the Tier 3 Domain Fallback
+        if ($supplierName -eq "Unknown" -and $fallbackSupplier -ne "Unknown") {
+            $supplierName = $fallbackSupplier
+            Write-Log " [GOOD] Matched via Corporate Domain (Fallback) -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+        }
+
+        if ($supplierName -eq "Unknown" -and $fallbackSupplier -ne "Unknown") {
+            $supplierName = $fallbackSupplier
+            Write-Log " [GOOD] Matched via Corporate Domain (Fallback) -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+        }
+
         if ($supplierName -eq "Unknown") {
-            Write-Log " [WARNING] No Match Found. Leaving email untouched in Inbox." -Level "WARN" -Color "Yellow" -MsgID $MsgID
+            Write-Log " [WARNING] No Match Found for '$senderEmail'. Leaving email untouched in Inbox." -Level "WARN" -Color "Yellow" -MsgID $MsgID
             Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Untouched (Unknown Vendor)" -LogType "Runtime" -MsgID $MsgID
             continue 
         } else {
-            # --- OLD SIMPLE FOLDER LOGIC (COMMENTED OUT) ---
-            # $firstLetter = $supplierName.Substring(0,1).ToUpper()
-            # $targetSubFolder = if ($firstLetter -match "[A-Z]") { $firstLetter } else { "#" }
-            # $finalSmbPath = Join-Path $config.Paths.SMBDestination $targetSubFolder
-            # -----------------------------------------------
-
-            # --- NEW SYNCHRONIZED FOLDER LOGIC (v1.8) ---
+            # --- NEW SYNCHRONIZED FOLDER LOGIC (v1.11) ---
             $firstLetter = $supplierName.Substring(0,1).ToUpper()
-            $targetSubFolder = if ($firstLetter -match "[A-Z]") { $firstLetter } else { "#" }
-            $expectedPattern = "(?i)^$targetSubFolder\s*-\s*Invoices$"
+            
+            if ($firstLetter -match "[A-Z]") {
+                $targetSubFolder = $firstLetter
+                $folderNameForLog = "$targetSubFolder - Invoices"
+                $expectedPattern = "(?i)^$targetSubFolder\s*-\s*Invoices$"
+            } else {
+                $targetSubFolder = "123 - Folder"
+                $folderNameForLog = "123 - Folder"
+                $expectedPattern = "(?i)^123\s*-\s*Folder$"
+            }
 
-            # 1. Resolve SMB Path (Discover actual folder name on share like 'A - Invoices')
+            # 1. Resolve SMB Path (Discover actual folder name on share like 'A - Invoices' or '123 - Folder')
             try {
                 $matchedSmbDir = Get-ChildItem -Path $config.Paths.SMBDestination -Directory -ErrorAction SilentlyContinue | 
                                  Where-Object { $_.Name -match $expectedPattern } | Select-Object -First 1
@@ -295,15 +327,24 @@ try {
                     $cleanSupplier = ($supplierName -replace '[^a-zA-Z0-9\s\-]', '' -replace '\s+', '-').TrimEnd('-')
                     $baseName = "$cleanSupplier-$dateStamp-$nameWithoutExt"
                     
+                    # --- FIXED COLLISION LOGIC ---
+                    # 1. Determine staging extension BEFORE the collision check
+                    $stagingExt = if ($ext -match "\.(docx|doc|xlsx|xls|csv|jpg|jpeg)$") { $ext } else { ".pdf" }
+                    
                     $counter = 0
                     $finalPdfName = "$baseName.pdf"
-                    while (Test-Path (Join-Path $finalSmbPath $finalPdfName)) {
+                    $currentStagingName = "$baseName$stagingExt"
+                    
+                    # 2. Check BOTH the SMB (.pdf) and the local staging folder (actual extension)
+                    while ((Test-Path (Join-Path $finalSmbPath $finalPdfName)) -or (Test-Path (Join-Path $config.Paths.Staging $currentStagingName))) {
                         $counter++
                         $paddedCounter = "{0:D2}" -f $counter
                         $finalPdfName = "$baseName($paddedCounter).pdf"
+                        $currentStagingName = "$baseName($paddedCounter)$stagingExt"
                     }
+                    # -----------------------------
                     
-                    $newFileName = if ($counter -eq 0) { "$baseName$ext" } else { "$baseName($paddedCounter)$ext" }
+                    $newFileName = $currentStagingName
                     Write-Log "  -> [RENAMING] New Invoice Name: $newFileName" -Level "INFO" -Color "Magenta" -MsgID $MsgID
                     
                     $stagingPath = Join-Path $config.Paths.Staging $newFileName
@@ -314,12 +355,9 @@ try {
                         [System.IO.File]::WriteAllBytes($stagingPath, [System.Convert]::FromBase64String($rawAttachment.contentBytes))
                         
                         if ($ext -match "\.(docx|doc|xlsx|xls|csv)$") {
-                            
-                            # --- INTERCEPT: FORMAT EXCEL FILES ---
                             if ($ext -match "\.(xlsx|xls)$") {
                                 Format-ExcelForPdf -FilePath $stagingPath -MsgID $MsgID
                             }
-                            # -------------------------------------
 
                             Write-Log "  -> [CONVERTING] Running LibreOffice Headless on $ext..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
                             $process = Start-Process -FilePath "libreoffice" -ArgumentList "--headless", "--convert-to", "pdf", "`"$stagingPath`"", "--outdir", "`"$($config.Paths.Staging)`"" -Wait -PassThru
@@ -386,21 +424,13 @@ try {
 
         # --- 4. MAILBOX ROUTING LOGIC (Read & Move) ---
         if ($simulateMove -eq $true) {
-            # --- UPGRADED SIMULATION FEEDBACK ---
             if ($null -ne $targetMailFolder) {
                 Write-Log "   [SIMULATION] Target mailbox folder found! Would move to: '$($targetMailFolder.DisplayName)'." -Level "INFO" -Color "Magenta" -MsgID $MsgID
             } else {
-                Write-Log "   [SIMULATION WARNING] Target folder '$targetSubFolder - Invoices' NOT FOUND at Root." -Level "WARN" -Color "Yellow" -MsgID $MsgID
+                Write-Log "   [SIMULATION WARNING] Target folder '$folderNameForLog' NOT FOUND at Root." -Level "WARN" -Color "Yellow" -MsgID $MsgID
             }
             Write-Log "   [SIMULATION] Email left unread and untouched in Inbox." -Level "INFO" -Color "DarkGray" -MsgID $MsgID
-            # ------------------------------------
         } else {
-            # --- OLD FOLDER DISCOVERY (MOVED TO TOP IN v1.6) ---
-            # Fuzzy match folder names like "A - Invoices", "A- Invoices", "A -Invoices", etc.
-            # $expectedPattern = "(?i)^$targetSubFolder\s*-\s*Invoices$"
-            # $targetMailFolder = $inboxSubfolders | Where-Object { $_.DisplayName -match $expectedPattern } | Select-Object -First 1
-            # ---------------------------------------------------
-
             if ($null -ne $targetMailFolder) {
                 try {
                     Update-MgUserMessage -UserId $targetMailbox -MessageId $msg.Id -IsRead -ErrorAction Stop | Out-Null
@@ -410,7 +440,7 @@ try {
                     Write-Log "   [FAIL] Failed to update/move email in mailbox: $($_.Exception.Message)" -Level "ERROR" -Color "Red" -MsgID $MsgID
                 }
             } else {
-                Write-Log "   [WARN] Target mailbox folder matching '$targetSubFolder - Invoices' not found at Root. Email left untouched." -Level "WARN" -Color "Yellow" -MsgID $MsgID
+                Write-Log "   [WARN] Target mailbox folder matching '$folderNameForLog' not found at Root. Email left untouched." -Level "WARN" -Color "Yellow" -MsgID $MsgID
             }
         }
     }
