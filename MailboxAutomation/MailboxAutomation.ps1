@@ -29,7 +29,7 @@
     7. Added Mailbox Routing: Marks emails as read and moves them from the Inbox to fuzzy-matched top-level mailbox folders (e.g., root "A - Invoices").
 
     .VERSION
-    1.20
+    1.23
 
     .NOTES
     - Explicit regex sanitization is used for vendor names to prevent directory traversal.
@@ -42,6 +42,20 @@
 $ErrorActionPreference = "Stop" # Prevents silent failures
 # Generates a unique ID to more easily group and filter log entries for each individual execution.
 $global:RunID = "RUN-$(Get-Date -Format 'yyyyMMddHHmm')-$((Get-Random -Maximum 9999).ToString('0000'))"
+
+# --- 0. CONCURRENCY LOCK ---
+$lockFile = "/opt/ap-automation/staging/ap_automation.lock"
+if (Test-Path -Path $lockFile) {
+    $lockAge = (Get-Date) - (Get-Item $lockFile).LastWriteTime
+    if ($lockAge.TotalMinutes -lt 15) {
+        Write-Host "WARNING: Another instance is currently running. Exiting to prevent file collisions." -ForegroundColor Yellow
+        exit
+    } else {
+        # Clear stale lock from a previous crash
+        Remove-Item -Path $lockFile -Force
+    }
+}
+New-Item -Path $lockFile -ItemType File -Force | Out-Null
 
 # --- HELPER FUNCTIONS ---
 function Write-Log {
@@ -81,13 +95,15 @@ function Format-InvoiceName {
         [string]$SupplierName,
         [string]$OriginalFileName
     )
+    # Added # and other reserved URI chars to the stripping list
     $cleanSupplier = $SupplierName -replace '[^a-zA-Z0-9\s\-]', ''
+    $cleanFileName = $OriginalFileName -replace '[#%&{}\\<>*?/$!''"@+|=]', '' # Clean the attachment name too!
+    
     $cleanSupplier = ($cleanSupplier -replace '\s+', '-') -replace '\-+', '-'
-    $cleanSupplier = $cleanSupplier.TrimEnd('-')
-    return "$cleanSupplier-$OriginalFileName"
+    return "$($cleanSupplier.TrimEnd('-'))-$cleanFileName"
 }
 
-# --- NEW EXCEL FORMATTING FUNCTION ---
+# --- EXCEL FORMATTING FUNCTION ---
 function Format-ExcelForPdf {
     param (
         [string]$FilePath,
@@ -95,39 +111,39 @@ function Format-ExcelForPdf {
     )
     
     try {
-        # EXPLICITLY LOAD THE MODULE FIRST
         Import-Module ImportExcel -ErrorAction Stop
-        
         Write-Log "  -> [FORMATTING] Adjusting Excel print settings (Landscape, Fit-to-Width)..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
         
-        # Open the Excel file in memory
-        $pkg = Open-ExcelPackage -Path $FilePath
+        # 1. ATTEMPT TO OPEN (If this fails, the file is fake/corrupted)
+        $pkg = Open-ExcelPackage -Path $FilePath -ErrorAction Stop
         
-        # Loop through every sheet (tab) in the workbook
         foreach ($ws in $pkg.Workbook.Worksheets) {
-            
-            # Force the page orientation to Landscape
             $ws.PrinterSettings.Orientation = [OfficeOpenXml.eOrientation]::Landscape
-            
-            # Turn on the "Fit to Page" toggle
             $ws.PrinterSettings.FitToPage = $true
-            
-            # Constrain width to 1 page, but let height be unlimited (0)
             $ws.PrinterSettings.FitToWidth = 1
             $ws.PrinterSettings.FitToHeight = 0
-            
-            # Shrink the margins to give data more room
             $ws.PrinterSettings.LeftMargin = 0.25
             $ws.PrinterSettings.RightMargin = 0.25
         }
         
-        # Save the changes back to the physical file and close it
-        Close-ExcelPackage -ExcelPackage $pkg
+        # 2. ATTEMPT TO SAVE (This is what fails on Linux without libgdiplus)
+        Close-ExcelPackage -ExcelPackage $pkg -ErrorAction Stop
         
         Write-Log "  -> [GOOD] Excel file pre-formatted successfully." -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+        return $true
+        
     } catch {
-        # If it fails, we throw a warning but let LibreOffice try its best anyway
-        Write-Log "  -> [WARN] Failed to pre-format Excel file: $($_.Exception.Message)" -Level "WARN" -Color "Yellow" -MsgID $MsgID
+        $errMsg = $_.Exception.Message
+        
+        # Check if the error is just the Linux Save/Graphics issue
+        if ($errMsg -match "Save" -or $errMsg -match "Error saving file") {
+            Write-Log "  -> [WARN] Excel formatting skipped (Linux dependency missing). Raw file is valid. Proceeding to LibreOffice." -Level "WARN" -Color "Yellow" -MsgID $MsgID
+            return $true # Soft Fail: Let LibreOffice handle the raw file
+        } else {
+            # If it's any other error, the file is genuinely broken
+            Write-Log "  -> [FAIL] Excel file is corrupted or unreadable: $errMsg" -Level "ERROR" -Color "Red" -MsgID $MsgID
+            return $false # Hard Fail: Kill the process for this file
+        }
     }
 }
 
@@ -175,6 +191,13 @@ if ($config.Paths.SMBDestination -in $unsafeSystemRoots) {
 }
 
 # 3. CSV Schema Verification
+try {
+    $mapping = Import-Csv $config.Paths.CSVPath -ErrorAction Stop
+} catch {
+    Write-Log "[FAIL] Pre-Flight Error: Could not read the CSV file at $($config.Paths.CSVPath). Is it locked?" -Level "ERROR" -Color "Red" -MsgID "SYS"
+    throw "ValidationFailed: CSV Read Error."
+}
+
 if ($null -eq $mapping -or $mapping.Count -eq 0) {
     Write-Log "[FAIL] Pre-Flight Error: The CSV mapping file is empty or failed to load." -Level "ERROR" -Color "Red" -MsgID "SYS"
     throw "ValidationFailed: Empty Mapping Document."
@@ -206,7 +229,6 @@ $keyPath  = $config.AzureAd.KeyPath
 $clientId = $config.AzureAd.ClientId
 $tenantId = $config.AzureAd.TenantId
 $targetMailbox = $config.Email.TargetMailbox
-$mapping = Import-Csv $config.Paths.CSVPath
 $genericDomains = $config.Email.GenericDomains
 $internalDomains = $config.Email.InternalDomains
 $allowedDocs   = $config.Email.AllowedDocs
@@ -282,6 +304,8 @@ try {
     foreach ($msg in $messages) {
         # Generate short Message Correlation ID
         $MsgID = if ($msg.Id.Length -ge 8) { $msg.Id.Substring($msg.Id.Length - 8) } else { "UNKNOWN" }
+        # Assume success until a failure occurs
+        $allAttachmentsSuccessful = $true
         
         Write-Log "`n----------------------------------------" -Level "INFO" -Color "White" -MsgID $MsgID
         
@@ -295,7 +319,7 @@ try {
         # BUSINESS LOGIC: Prevents processing non-invoice financial documents (e.g., 'Account Statement').
         # TECHNICAL LOGIC: Dynamically builds a regex string from the config. 
         # INTENTIONAL FAIL-SAFE: If $keyWordExceptions is empty, the regex (?i)() is generated.
-        # This matches ALL subject lines and file names, causing the script to skip the entire inbox. This prevents accidental ingestion of non-validated data if the configuration is cleared..
+        # This matches ALL subject lines and file names, causing the script to skip the entire inbox. This prevents accidental ingestion of non-validated data if the configuration is cleared.
         
         $escapedKeywords = $keyWordExceptions | ForEach-Object { [regex]::Escape($_) }
         $killRegex = "(?i)(" + ($escapedKeywords -join "|") + ")"
@@ -426,9 +450,9 @@ try {
 
                     Write-Log "  -> [KEEP] Found Invoice: $($att.Name)" -Level "INFO" -Color "Green" -MsgID $MsgID
                     
+                    # Ensure we use the function to sanitize both Supplier and Original File Name
                     $nameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($att.Name)
-                    $cleanSupplier = ($supplierName -replace '[^a-zA-Z0-9\s\-]', '' -replace '\s+', '-').TrimEnd('-')
-                    $baseName = "$cleanSupplier-$dateStamp-$nameWithoutExt"
+                    $baseName = Format-InvoiceName -SupplierName $supplierName -OriginalFileName $nameWithoutExt
                     
                     # --- FIXED COLLISION LOGIC ---
                     # 1. Determine staging extension BEFORE the collision check
@@ -458,57 +482,93 @@ try {
                         $rawAttachment = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
                         [System.IO.File]::WriteAllBytes($stagingPath, [System.Convert]::FromBase64String($rawAttachment.contentBytes))
                         
-                        if ($ext -match $docRegex) {
+                        # Short pause to ensure the OS has released the file handle before Excel or LibreOffice touches it
+                        Start-Sleep -Milliseconds 500
+                        
+                        if ($ext -match $docRegex -and $ext -ne ".pdf") {
                             if ($ext -match "\.(xlsx|xls)$") {
-                                Format-ExcelForPdf -FilePath $stagingPath -MsgID $MsgID
+                                # If it returns $false, the file is genuinely corrupted. Kill it.
+                                if (-not (Format-ExcelForPdf -FilePath $stagingPath -MsgID $MsgID)) {
+                                    Write-Log "   -> [SKIP] Skipping conversion due to fatal Excel error. Deleting corrupted file." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                    Remove-Item -Path $stagingPath -Force -ErrorAction SilentlyContinue
+                                    $allAttachmentsSuccessful = $false
+                                    continue 
+                                }
                             }
-                            Write-Log "  -> [CONVERTING] Running LibreOffice Headless on $ext..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
+
+                            Write-Log "  -> [CONVERTING] Running LibreOffice Headless on $ext (Max 60s timeout)..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
+                            # REMOVED -Wait here so the timeout below actually works
                             $process = Start-Process -FilePath "libreoffice" -ArgumentList "--headless", "--convert-to", "pdf", "`"$stagingPath`"", "--outdir", "`"$($config.Paths.Staging)`"" -PassThru
+                            
                             if ($process.WaitForExit(60000)) {
-                                if ($process.ExitCode -eq 0) {
+                                $pdfPath = [System.IO.Path]::ChangeExtension($stagingPath, ".pdf")
+                                if ($process.ExitCode -eq 0 -and (Test-Path -Path $pdfPath)) {
                                     Write-Log "  -> [GOOD] Document successfully converted to PDF!" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                                     Remove-Item -Path $stagingPath -Force
-                                    $filesToMove += [System.IO.Path]::ChangeExtension($stagingPath, ".pdf")
+                                    $filesToMove += $pdfPath
                                     $processedFileNames += $finalPdfName
                                 } else {
-                                    Write-Log "  -> [FAIL] LibreOffice exited with error code $($process.ExitCode)." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                    Write-Log "  -> [FAIL] LibreOffice failed. ExitCode: $($process.ExitCode). Output file not found." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                    $allAttachmentsSuccessful = $false
                                 }
                             } else {
                                 Stop-Process -Id $process.Id -Force
                                 Write-Log "  -> [FAIL] TIMEOUT: LibreOffice hung for over 60 seconds and was terminated." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                $allAttachmentsSuccessful = $false
                             }
                         }
                         elseif ($ext -match $imageRegex -and $ext -ne ".pdf") {
                             Write-Log "  -> [CONVERTING] Running img2pdf on $ext (Max 60s timeout)..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
-                            $convertedPdfPath = [System.IO.Path]::ChangeExtension($stagingPath, ".pdf")
-                            $process = Start-Process -FilePath "img2pdf" -ArgumentList "`"$stagingPath`"", "-o", "`"$convertedPdfPath`"" -PassThru
+                            
+                            # 1. Explicitly define the target PDF path
+                            $pdfPath = [System.IO.Path]::ChangeExtension($stagingPath, ".pdf")
+                            
+                            # 2. Execute conversion
+                            $process = Start-Process -FilePath "img2pdf" -ArgumentList "`"$stagingPath`"", "-o", "`"$pdfPath`"" -PassThru
+                            
                             if ($process.WaitForExit(60000)) {
-                                if ($process.ExitCode -eq 0) {
+                                # 3. PHYSICAL REALITY CHECK: Check ExitCode AND verify the file exists on the disk
+                                if ($process.ExitCode -eq 0 -and (Test-Path -Path $pdfPath)) {
                                     Write-Log "  -> [GOOD] Image successfully converted to PDF!" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+                                    
+                                    # Cleanup: Remove the original image (e.g., the .jpg) now that the .pdf exists
                                     Remove-Item -Path $stagingPath -Force
-                                    $filesToMove += $convertedPdfPath
+                                    
+                                    # Add ONLY the verified PDF path to the move list
+                                    $filesToMove += $pdfPath
                                     $processedFileNames += $finalPdfName
                                 } else {
-                                    Write-Log "  -> [FAIL] img2pdf exited with error code $($process.ExitCode)." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                    # This catches cases where img2pdf "finishes" but fails to write the file
+                                    Write-Log "  -> [FAIL] img2pdf failed. ExitCode: $($process.ExitCode). Output file not found or inaccessible." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                    $allAttachmentsSuccessful = $false
                                 }
                             } else {
+                                # Timeout logic
                                 Stop-Process -Id $process.Id -Force
-                                Write-Log "  -> [FAIL] TIMEOUT: img2pdf hung for over 30 seconds and was terminated." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                Write-Log "  -> [FAIL] TIMEOUT: img2pdf hung for over 60 seconds and was terminated." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                $allAttachmentsSuccessful = $false
                             }
                         }
                         elseif ($ext -eq ".pdf") {
-                            $filesToMove += $stagingPath
-                            $processedFileNames += $finalPdfName
+                            if (Test-Path -Path $stagingPath) {
+                                $filesToMove += $stagingPath
+                                $processedFileNames += $finalPdfName
+                            } else {
+                                Write-Log "  -> [FAIL] PDF download failed. File not found in staging: $stagingPath" -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                $allAttachmentsSuccessful = $false
+                            }
                         }
                         $validAttachments += $att
                     } 
                     catch [System.Net.WebException], [Microsoft.Graph.PowerShell.Models.MicrosoftGraphODataErrorsOdataError] {
                         # Handles Network Timeouts, API Throttling, or Microsoft Graph Outages
                         Write-Log "  -> [FAIL] GRAPH API ERROR: Failed to fetch attachment '$($att.Name)'. Possible timeout or throttling." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                        $allAttachmentsSuccessful = $false
                     }
                     catch [System.IO.IOException] {
                         # Handles Local Disk Full, File Locked by another process, or Invalid File Name formats
                         Write-Log "  -> [FAIL] DISK I/O ERROR: Cannot write to $stagingPath. Check disk space or folder locks." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                        $allAttachmentsSuccessful = $false
                     }
                     catch [System.UnauthorizedAccessException] {
                         # Handles catastrophic permission loss on the Linux host
@@ -519,6 +579,7 @@ try {
                         # The Fallback for anything truly unexpected
                         $errInfo = if ($config.Logging.Verbose) { "$($_.Exception.Message) (Line: $($_.InvocationInfo.ScriptLineNumber))" } else { $_.Exception.Message }
                         Write-Log "  -> [FAIL] Attachment Process Failed: $errInfo" -Level "ERROR" -Color "Red" -MsgID $MsgID
+                        $allAttachmentsSuccessful = $false
                     }
                 }
             }
@@ -531,6 +592,9 @@ try {
         # --- 3. SMB FOLDER ROUTING LOGIC ---
         Write-Log " Routing $($validAttachments.Count) file(s) to SMB Folder: $finalSmbPath" -Level "INFO" -Color "Cyan" -MsgID $MsgID
         
+        # Short pause to ensure file handles are released by external binaries before moving
+        Start-Sleep -Seconds 1 
+        
         if ($simulateSMB -eq $true) {
             if (Test-Path -Path $finalSmbPath) {
                 Write-Log "   [GOOD] Folder Exists on SMB Share." -Level "SUCCESS" -Color "Green" -MsgID $MsgID
@@ -542,8 +606,12 @@ try {
             if (Test-Path -Path $finalSmbPath) {
                 foreach ($file in $filesToMove) {
                     try { 
-                        Move-Item -Path $file -Destination $finalSmbPath -Force 
-                        Write-Log "   -> [MOVED] Successfully moved to SMB: $(Split-Path $file -Leaf)" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+                        if (Test-Path -Path $file) {
+                            Move-Item -Path $file -Destination $finalSmbPath -Force 
+                            Write-Log "   -> [MOVED] Successfully moved to SMB: $(Split-Path $file -Leaf)" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+                        } else {
+                            Write-Log "   -> [FAIL] Move Skipped: File disappeared from staging before move: $(Split-Path $file -Leaf)" -Level "ERROR" -Color "Red" -MsgID $MsgID
+                        }
                     } catch { 
                         Write-Log "   -> [FAIL] Move Failed: $($_.Exception.Message)" -Level "ERROR" -Color "Red" -MsgID $MsgID
                     }
@@ -555,7 +623,10 @@ try {
         }
 
         # --- 4. MAILBOX ROUTING LOGIC (Read & Move) ---
-        if ($simulateMove -eq $true) {
+        if ($allAttachmentsSuccessful -eq $false) {
+            Write-Log "   [HOLD] One or more attachments failed processing. Leaving email unread in Inbox for manual review." -Level "WARN" -Color "Yellow" -MsgID $MsgID
+        }
+        elseif ($simulateMove -eq $true) {
             if ($null -ne $targetMailFolder) {
                 Write-Log "   [SIMULATION] Target mailbox folder found! Would move to: '$($targetMailFolder.DisplayName)'." -Level "INFO" -Color "Magenta" -MsgID $MsgID
             } else {
@@ -619,5 +690,8 @@ finally {
                 }
             }
         }
+    }
+    if (Test-Path $lockFile) {
+        Remove-Item -Path $lockFile -Force -ErrorAction SilentlyContinue
     }
 }
