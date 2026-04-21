@@ -3,7 +3,7 @@
     Created By - Kristopher Roy
     Created On - 2026-03-20
     Revised On - 2026-04-14
-    Revised On - 2026-04-14 (Descriptive Comments Added)
+    Revised On - 2026-04-21 (Added a Pre-Flight config check and verification)
     Modules Required: Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Mail, ImportExcel
 
     .Important
@@ -17,6 +17,7 @@
 
     .DESCRIPTION
     Automates the ingestion of AP invoices from a Microsoft 365 mailbox. The script:
+    Upon starting the Script will immediately verify the config file exists and that the values are acceptable for the scripts use.
     1. Authenticates via MS Graph using a certificate.
     2. Filters inbox messages for attachments and specific 'Test Mode' senders.
     3. Employs a 'Waterfall' matching logic to map senders to vendors via CSV.
@@ -28,16 +29,18 @@
     7. Added Mailbox Routing: Marks emails as read and moves them from the Inbox to fuzzy-matched top-level mailbox folders (e.g., root "A - Invoices").
 
     .VERSION
-    1.11
+    1.20
 
     .NOTES
     - Explicit regex sanitization is used for vendor names to prevent directory traversal.
     - Collision detection (suffixing files with (01), (02)) prevents overwriting 
       existing invoices on the SMB share.
+    - Added additional robust try catch blocks to make sure that each loop is succesful, or gets skipped, and also to ensure that our configs load in succesfully and Graph connects succesfully
 #>
 
 # --- GLOBAL ERROR TRAP & RUN IDENTITY ---
 $ErrorActionPreference = "Stop" # Prevents silent failures
+# Generates a unique ID to more easily group and filter log entries for each individual execution.
 $global:RunID = "RUN-$(Get-Date -Format 'yyyyMMddHHmm')-$((Get-Random -Maximum 9999).ToString('0000'))"
 
 # --- HELPER FUNCTIONS ---
@@ -130,6 +133,72 @@ function Format-ExcelForPdf {
 # --- INITIALIZATION of CONFIG FILE---
 $config = Get-Content "/opt/ap-automation/configs/config.json" | ConvertFrom-Json
 
+# --- PRE-FLIGHT VALIDATION & SCHEMA INTEGRITY BLOCK ---
+Write-Log "Initializing Pre-Flight Environment Validation..." -Level "INFO" -Color "Cyan" -MsgID "SYS"
+
+# 1. Critical Key & Path Existence Verification
+$criticalPaths = @{
+    "Staging"        = $config.Paths.Staging
+    "CSVPath"        = $config.Paths.CSVPath
+    "SMBDestination" = $config.Paths.SMBDestination
+}
+
+foreach ($item in $criticalPaths.GetEnumerator()) {
+    if ([string]::IsNullOrWhiteSpace($item.Value)) {
+        Write-Log "[FAIL] Pre-Flight Error: $($item.Name) path is null or empty in config.json." -Level "ERROR" -Color "Red" -MsgID "SYS"
+        throw "ValidationFailed: Missing $($item.Name) path in configuration."
+    }
+    # Skip existence check on SMB if simulating SMB, otherwise require it.
+    if ($item.Name -eq "SMBDestination" -and $simulateSMB -eq $true) {
+        continue
+    }
+    if (-not (Test-Path -Path $item.Value)) {
+        Write-Log "[FAIL] Pre-Flight Error: $($item.Name) path does not exist on disk: $($item.Value)" -Level "ERROR" -Color "Red" -MsgID "SYS"
+        throw "ValidationFailed: Path not found - $($item.Value)"
+    }
+}
+
+# 2. Path Safety Boundary Checks (Anti-Directory Traversal)
+$safeAppRoot = "/opt/ap-automation/"
+$unsafeSystemRoots = @("/", "/etc", "/bin", "/var", "/root", "/usr")
+
+$resolvedStaging = (Resolve-Path $config.Paths.Staging -ErrorAction Stop).Path
+if (-not $resolvedStaging.StartsWith($safeAppRoot)) {
+    Write-Log "[FAIL] Security Exception: Staging path ($resolvedStaging) is outside the safe application boundary ($safeAppRoot)." -Level "ERROR" -Color "Red" -MsgID "SYS"
+    throw "SecurityException: Staging boundary violation."
+}
+
+if ($config.Paths.SMBDestination -in $unsafeSystemRoots) {
+    Write-Log "[FAIL] Security Exception: SMBDestination points to a protected system root." -Level "ERROR" -Color "Red" -MsgID "SYS"
+    throw "SecurityException: SMB Destination root violation."
+}
+
+# 3. CSV Schema Verification
+if ($null -eq $mapping -or $mapping.Count -eq 0) {
+    Write-Log "[FAIL] Pre-Flight Error: The CSV mapping file is empty or failed to load." -Level "ERROR" -Color "Red" -MsgID "SYS"
+    throw "ValidationFailed: Empty Mapping Document."
+}
+
+$expectedHeaders = @(
+    "Email - AP Vendor List", 
+    "Email - Vendor Match", 
+    "Domain", 
+    "Supplier Name"
+)
+
+# Extract actual headers from the first row of the PSObject
+$actualHeaders = $mapping[0].psobject.properties.name
+
+foreach ($header in $expectedHeaders) {
+    if ($header -notin $actualHeaders) {
+        Write-Log "[FAIL] Schema Error: Required CSV column '$header' is missing from the mapping file." -Level "ERROR" -Color "Red" -MsgID "SYS"
+        throw "ValidationFailed: Invalid CSV Schema."
+    }
+}
+
+Write-Log "[GOOD] Pre-Flight Validation Passed. Configuration and Schema are sound." -Level "SUCCESS" -Color "Green" -MsgID "SYS"
+# ------------------------------------------------------
+
 # --- CONFIG VARIABLES ---
 $certPath = $config.AzureAd.CertPath
 $keyPath  = $config.AzureAd.KeyPath
@@ -139,8 +208,14 @@ $targetMailbox = $config.Email.TargetMailbox
 $mapping = Import-Csv $config.Paths.CSVPath
 $genericDomains = $config.Email.GenericDomains
 $internalDomains = $config.Email.InternalDomains
-$allowedExtensions = $config.Email.AllowedExtensions
+$allowedDocs   = $config.Email.AllowedDocs
+$allowedImages = $config.Email.AllowedImages
+#Merges the allowed docs list and the allowed images list
+$allowedExtensions= $allowedDocs + $allowedImages
 $minImageSize = if ($config.Email.MinImageSizeBytes) { $config.Email.MinImageSizeBytes } else { 30000 }
+#Build the strings powershell needs for parsing extension types
+$imageRegex = if ($allowedImages) { "(?i)\.(" + ($allowedImages.Replace('.','') -join '|') + ")$" } else { "(?i)\.(NONE)$" }
+$docRegex   = if ($allowedDocs) { "(?i)\.(" + ($allowedDocs.Replace('.','') -join '|') + ")$" } else { "(?i)\.(NONE)$" }
 
 $testFromEnabled = $config.Email.TestFromEnabled
 $testFromAddress = $config.Email.TestFromAddress
@@ -153,6 +228,9 @@ if (-not (Test-Path -Path $config.Paths.LogFolder)) {
     New-Item -ItemType Directory -Force -Path $config.Paths.LogFolder | Out-Null
 }
 
+# ==========================================
+# --- 1. DEDICATED CONNECTION BLOCK ---
+# ==========================================
 try {
     Write-Log "Connecting to Graph API..." -Level "INFO" -Color "Cyan"
     
@@ -160,7 +238,21 @@ try {
     Connect-MgGraph -ClientId $clientId -TenantId $tenantId -Certificate $cert -NoWelcome
 
     Write-Log "[GOOD] Connected to Graph successfully. Fetching Inbox Messages..." -Level "SUCCESS" -Color "Cyan"
+}
+catch [System.Security.Cryptography.CryptographicException] {
+    Write-Log "[FAIL] CERTIFICATE ERROR: The PEM file or Key ($certPath) is invalid or inaccessible." -Level "ERROR" -Color "Red"
+    throw "FatalError: Certificate Cryptographic Exception." # Terminates script immediately
+}
+catch [Microsoft.Graph.PowerShell.Authentication.CmdletException] {
+    Write-Log "[FAIL] AUTHENTICATION ERROR: Azure AD rejected the connection. Verify ClientID, TenantID, and App Permissions." -Level "ERROR" -Color "Red"
+    throw "FatalError: Graph API Authentication Denied." # Terminates script immediately
+}
+catch {
+    Write-Log "[FAIL] UNEXPECTED CONNECTION ERROR: $($_.Exception.Message)" -Level "ERROR" -Color "Red"
+    throw "FatalError: Unhandled Connection Exception." # Terminates script immediately
+}
 
+try {
     if ($testFromEnabled -eq $true) {
         Write-Log " [INFORMATIONAL] Test mode is ENABLED. Filtering only for emails from: $testFromAddress" -Level "INFO" -Color "Magenta"
         $filterQuery = "from/emailAddress/address eq '$testFromAddress' and hasAttachments eq true"
@@ -316,7 +408,7 @@ try {
             foreach ($att in $attachments) {
                 $ext = [System.IO.Path]::GetExtension($att.Name).ToLower()
                 if ($ext -in $allowedExtensions) {
-                    if ($ext -match "\.(jpg|jpeg|png|gif|bmp|tif|tiff)$" -and $att.Size -lt $minImageSize) {
+                    if ($ext -match $imageRegex -and $att.Size -lt $minImageSize) {
                         Write-Log "  -> [SKIP] Ignored Tiny Image: $($att.Name)" -Level "INFO" -Color "DarkGray" -MsgID $MsgID
                         continue
                     }
@@ -329,7 +421,7 @@ try {
                     
                     # --- FIXED COLLISION LOGIC ---
                     # 1. Determine staging extension BEFORE the collision check
-                    $stagingExt = if ($ext -match "\.(docx|doc|xlsx|xls|csv|jpg|jpeg)$") { $ext } else { ".pdf" }
+                    $stagingExt = if ($ext -match $docRegex -or $ext -match $imageRegex) { $ext } else { ".pdf" }
                     
                     $counter = 0
                     $finalPdfName = "$baseName.pdf"
@@ -351,32 +443,46 @@ try {
                     try {
                         Write-Log "  -> [DOWNLOADING] Fetching file data to Staging..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
                         $uri = "https://graph.microsoft.com/v1.0/users/$targetMailbox/messages/$($msg.Id)/attachments/$($att.Id)"
-                        $rawAttachment = Invoke-MgGraphRequest -Method GET -Uri $uri
+                        # Added -ErrorAction Stop to guarantee Graph errors trigger the catch block
+                        $rawAttachment = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
                         [System.IO.File]::WriteAllBytes($stagingPath, [System.Convert]::FromBase64String($rawAttachment.contentBytes))
                         
-                        if ($ext -match "\.(docx|doc|xlsx|xls|csv)$") {
+                        if ($ext -match $docRegex) {
                             if ($ext -match "\.(xlsx|xls)$") {
                                 Format-ExcelForPdf -FilePath $stagingPath -MsgID $MsgID
                             }
-
                             Write-Log "  -> [CONVERTING] Running LibreOffice Headless on $ext..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
                             $process = Start-Process -FilePath "libreoffice" -ArgumentList "--headless", "--convert-to", "pdf", "`"$stagingPath`"", "--outdir", "`"$($config.Paths.Staging)`"" -Wait -PassThru
-                            if ($process.ExitCode -eq 0) {
-                                Write-Log "  -> [GOOD] Document successfully converted to PDF!" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
-                                Remove-Item -Path $stagingPath -Force
-                                $filesToMove += [System.IO.Path]::ChangeExtension($stagingPath, ".pdf")
-                                $processedFileNames += $finalPdfName
+                            if ($process.WaitForExit(60000)) {
+                                if ($process.ExitCode -eq 0) {
+                                    Write-Log "  -> [GOOD] Document successfully converted to PDF!" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+                                    Remove-Item -Path $stagingPath -Force
+                                    $filesToMove += [System.IO.Path]::ChangeExtension($stagingPath, ".pdf")
+                                    $processedFileNames += $finalPdfName
+                                } else {
+                                    Write-Log "  -> [FAIL] LibreOffice exited with error code $($process.ExitCode)." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                }
+                            } else {
+                                Stop-Process -Id $process.Id -Force
+                                Write-Log "  -> [FAIL] TIMEOUT: LibreOffice hung for over 60 seconds and was terminated." -Level "ERROR" -Color "Red" -MsgID $MsgID
                             }
                         }
-                        elseif ($ext -match "\.(jpg|jpeg)$") {
-                            Write-Log "  -> [CONVERTING] Running img2pdf on $ext..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
+                        elseif ($ext -match $imageRegex -and $ext -ne ".pdf") {
+                            Write-Log "  -> [CONVERTING] Running img2pdf on $ext (Max 60s timeout)..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
                             $convertedPdfPath = [System.IO.Path]::ChangeExtension($stagingPath, ".pdf")
-                            $process = Start-Process -FilePath "img2pdf" -ArgumentList "`"$stagingPath`"", "-o", "`"$convertedPdfPath`"" -Wait -PassThru
-                            if ($process.ExitCode -eq 0) {
-                                Write-Log "  -> [GOOD] Image successfully converted to PDF!" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
-                                Remove-Item -Path $stagingPath -Force
-                                $filesToMove += $convertedPdfPath
-                                $processedFileNames += $finalPdfName
+                            $process = Start-Process -FilePath "img2pdf" -ArgumentList "`"$stagingPath`"", "-o", "`"$convertedPdfPath`"" -PassThru
+                            if ($process.WaitForExit(60000)) {
+                                if ($process.ExitCode -eq 0) {
+                                    Write-Log "  -> [GOOD] Image successfully converted to PDF!" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+                                    Remove-Item -Path $stagingPath -Force
+                                    $filesToMove += $convertedPdfPath
+                                    $processedFileNames += $finalPdfName
+                                } else {
+                                    Write-Log "  -> [FAIL] img2pdf exited with error code $($process.ExitCode)." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                }
+                            } else {
+                                Stop-Process -Id $process.Id -Force
+                                Write-Log "  -> [FAIL] TIMEOUT: img2pdf hung for over 30 seconds and was terminated." -Level "ERROR" -Color "Red" -MsgID $MsgID
                             }
                         }
                         elseif ($ext -eq ".pdf") {
@@ -384,7 +490,22 @@ try {
                             $processedFileNames += $finalPdfName
                         }
                         $validAttachments += $att
-                    } catch {
+                    } 
+                    catch [System.Net.WebException], [Microsoft.Graph.PowerShell.Models.MicrosoftGraphODataErrorsOdataError] {
+                        # Handles Network Timeouts, API Throttling, or Microsoft Graph Outages
+                        Write-Log "  -> [FAIL] GRAPH API ERROR: Failed to fetch attachment '$($att.Name)'. Possible timeout or throttling." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                    }
+                    catch [System.IO.IOException] {
+                        # Handles Local Disk Full, File Locked by another process, or Invalid File Name formats
+                        Write-Log "  -> [FAIL] DISK I/O ERROR: Cannot write to $stagingPath. Check disk space or folder locks." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                    }
+                    catch [System.UnauthorizedAccessException] {
+                        # Handles catastrophic permission loss on the Linux host
+                        Write-Log "  -> [FAIL] PERMISSION ERROR: The script lacks write access to the staging directory." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                        throw "FatalError: Staging directory permissions invalid." # Terminate, no point in continuing
+                    }
+                    catch {
+                        # The Fallback for anything truly unexpected
                         $errInfo = if ($config.Logging.Verbose) { "$($_.Exception.Message) (Line: $($_.InvocationInfo.ScriptLineNumber))" } else { $_.Exception.Message }
                         Write-Log "  -> [FAIL] Attachment Process Failed: $errInfo" -Level "ERROR" -Color "Red" -MsgID $MsgID
                     }
@@ -447,7 +568,10 @@ try {
 }
 catch {
     $errInfo = if ($config.Logging.Verbose) { "$($_.Exception.Message) (Line: $($_.InvocationInfo.ScriptLineNumber))" } else { $_.Exception.Message }
-    Write-Log "[FAIL] CRITICAL ERROR: $errInfo" -Level "ERROR" -Color "Red"
+    Write-Log "[FAIL] FATAL RUNTIME ERROR: $errInfo" -Level "ERROR" -Color "Red" -MsgID "SYS"
+    
+    # Force the script to exit with an error state so the scheduler (e.g., cron) registers a failure.
+    throw "FatalError: Script execution aborted due to unhandled exception."
 }
 finally {
     if (Get-MgContext) { 
