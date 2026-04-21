@@ -74,7 +74,8 @@ function Write-Log {
 
     $formattedMessage | Out-File -FilePath $logPath -Append -Encoding UTF8
 }
-
+# Strips all special characters except hyphens and spaces to prevent file system write errors.
+# Also Consolidates multiple spaces/hyphens into a single hyphen for clean, predictable naming.
 function Format-InvoiceName {
     param (
         [string]$SupplierName,
@@ -290,7 +291,12 @@ try {
         
         Write-Log "Processing Email: $($msg.Subject) | Sender: $senderEmail" -Level "INFO" -Color "White" -MsgID $MsgID
         
-        # --- 0. STATEMENT & PAST DUE KILL SWITCH ---
+        # --- Keyword Skipping ---
+        # BUSINESS LOGIC: Prevents processing non-invoice financial documents (e.g., 'Account Statement').
+        # TECHNICAL LOGIC: Dynamically builds a regex string from the config. 
+        # INTENTIONAL FAIL-SAFE: If $keyWordExceptions is empty, the regex (?i)() is generated.
+        # This matches ALL subject lines and file names, causing the script to skip the entire inbox. This prevents accidental ingestion of non-validated data if the configuration is cleared..
+        
         $escapedKeywords = $keyWordExceptions | ForEach-Object { [regex]::Escape($_) }
         $killRegex = "(?i)(" + ($escapedKeywords -join "|") + ")"
         
@@ -321,7 +327,12 @@ try {
             continue
         }
 
-        # --- 1. THE WATERFALL MATCHING LOGIC ---
+        # --- 1. HIERARCHICAL VENDOR MAPPING (WATERFALL LOGIC) ---
+        # BUSINESS LOGIC: Evaluates the sender's identity against the CSV schema in descending order of strictness.
+        # Tier 1: Exact Match on 'Email - AP Vendor List' (Highest Confidence)
+        # Tier 2: Exact Match on 'Email - Vendor Match'
+        # Tier 3: Fuzzy Regex Match on Sender Display Name
+        # Tier 4: Corporate Domain Fallback (Lowest Confidence, intentionally ignores generic domains like @gmail.com)
         $supplierName = "Unknown"
         $fallbackSupplier = "Unknown"
         Write-Host ">>> DEBUG: The raw Display Name PowerShell sees is: '$senderDisplayName'" -ForegroundColor Magenta
@@ -452,7 +463,7 @@ try {
                                 Format-ExcelForPdf -FilePath $stagingPath -MsgID $MsgID
                             }
                             Write-Log "  -> [CONVERTING] Running LibreOffice Headless on $ext..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
-                            $process = Start-Process -FilePath "libreoffice" -ArgumentList "--headless", "--convert-to", "pdf", "`"$stagingPath`"", "--outdir", "`"$($config.Paths.Staging)`"" -Wait -PassThru
+                            $process = Start-Process -FilePath "libreoffice" -ArgumentList "--headless", "--convert-to", "pdf", "`"$stagingPath`"", "--outdir", "`"$($config.Paths.Staging)`"" -PassThru
                             if ($process.WaitForExit(60000)) {
                                 if ($process.ExitCode -eq 0) {
                                     Write-Log "  -> [GOOD] Document successfully converted to PDF!" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
