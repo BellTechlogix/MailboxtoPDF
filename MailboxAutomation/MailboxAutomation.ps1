@@ -378,7 +378,12 @@ try {
                 Write-Log " [GOOD] Matched via Vendor Match -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                 break
             }
-            if (($csvSupplierName -ne "" -and $senderDisplayName -match [regex]::Escape($csvSupplierName)) -or ($csvApVendorList -ne "" -and $senderDisplayName -match [regex]::Escape($csvApVendorList))) {
+            # TIER 2: Display Name "Deep Scan" 
+            # Checks Supplier Name OR AP List OR Vendor Match column against the email's Display Name
+            if (($csvSupplierName -ne "" -and $senderDisplayName -match [regex]::Escape($csvSupplierName)) -or 
+                ($csvApVendorList -ne "" -and $senderDisplayName -match [regex]::Escape($csvApVendorList)) -or
+                ($csvVendorMatch  -ne "" -and $senderDisplayName -match [regex]::Escape($csvVendorMatch))) {
+                
                 $supplierName = $csvSupplierName
                 Write-Log " [GOOD] Matched via Display Name Tag -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                 break
