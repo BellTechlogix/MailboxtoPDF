@@ -3,7 +3,8 @@
     Created By - Kristopher Roy
     Created On - 2026-03-20
     Revised On - 2026-04-14
-    Revised On - 2026-04-21 (Added a Pre-Flight config check and verification)
+    Revised On - 2026-05-11 (Added better file filtering for signature blocks and name filtering for Display Names)
+    Revised On - 2026-05-14 (Added legacy xls handling bypass, commented out xls conversion logic for now))
     Modules Required: Microsoft.Graph.Authentication, Microsoft.Graph.Users, Microsoft.Graph.Mail, ImportExcel
 
     .Important
@@ -38,6 +39,9 @@
     - Added additional robust try catch blocks to make sure that each loop is succesful, or gets skipped, and also to ensure that our configs load in succesfully and Graph connects succesfully
 #>
 
+# --- ENABLE LINUX GRAPHICS FOR EXCEL AUTOFIT ---
+$env:DOTNET_System_Drawing_EnableUnixSupport = "true"
+
 # --- GLOBAL ERROR TRAP & RUN IDENTITY ---
 $ErrorActionPreference = "Stop" # Prevents silent failures
 # Generates a unique ID to more easily group and filter log entries for each individual execution.
@@ -45,14 +49,14 @@ $global:RunID = "RUN-$(Get-Date -Format 'yyyyMMddHHmm')-$((Get-Random -Maximum 9
 
 # --- 0. CONCURRENCY LOCK ---
 $lockFile = "/opt/ap-automation/staging/ap_automation.lock"
-if (Test-Path -Path $lockFile) {
+if (Test-Path -LiteralPath $lockFile) {
     $lockAge = (Get-Date) - (Get-Item $lockFile).LastWriteTime
     if ($lockAge.TotalMinutes -lt 15) {
         Write-Host "WARNING: Another instance is currently running. Exiting to prevent file collisions." -ForegroundColor Yellow
         exit
     } else {
         # Clear stale lock from a previous crash
-        Remove-Item -Path $lockFile -Force
+        Remove-Item -LiteralPath $lockFile -Force
     }
 }
 New-Item -Path $lockFile -ItemType File -Force | Out-Null
@@ -104,6 +108,7 @@ function Format-InvoiceName {
 }
 
 # --- EXCEL FORMATTING FUNCTION ---
+# --- EXCEL FORMATTING FUNCTION ---
 function Format-ExcelForPdf {
     param (
         [string]$FilePath,
@@ -114,10 +119,11 @@ function Format-ExcelForPdf {
         Import-Module ImportExcel -ErrorAction Stop
         Write-Log "  -> [FORMATTING] Adjusting Excel print settings (Landscape, Fit-to-Width)..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
         
-        # 1. ATTEMPT TO OPEN (If this fails, the file is fake/corrupted)
+        # 1. ATTEMPT TO OPEN
         $pkg = Open-ExcelPackage -Path $FilePath -ErrorAction Stop
         
         foreach ($ws in $pkg.Workbook.Worksheets) {
+            # NO AUTOFIT: Pure XML layout injection only!
             $ws.PrinterSettings.Orientation = [OfficeOpenXml.eOrientation]::Landscape
             $ws.PrinterSettings.FitToPage = $true
             $ws.PrinterSettings.FitToWidth = 1
@@ -126,7 +132,7 @@ function Format-ExcelForPdf {
             $ws.PrinterSettings.RightMargin = 0.25
         }
         
-        # 2. ATTEMPT TO SAVE (This is what fails on Linux without libgdiplus)
+        # 2. ATTEMPT TO SAVE
         Close-ExcelPackage -ExcelPackage $pkg -ErrorAction Stop
         
         Write-Log "  -> [GOOD] Excel file pre-formatted successfully." -Level "SUCCESS" -Color "Green" -MsgID $MsgID
@@ -135,14 +141,12 @@ function Format-ExcelForPdf {
     } catch {
         $errMsg = $_.Exception.Message
         
-        # Check if the error is just the Linux Save/Graphics issue
         if ($errMsg -match "Save" -or $errMsg -match "Error saving file") {
             Write-Log "  -> [WARN] Excel formatting skipped (Linux dependency missing). Raw file is valid. Proceeding to LibreOffice." -Level "WARN" -Color "Yellow" -MsgID $MsgID
-            return $true # Soft Fail: Let LibreOffice handle the raw file
+            return $true 
         } else {
-            # If it's any other error, the file is genuinely broken
             Write-Log "  -> [FAIL] Excel file is corrupted or unreadable: $errMsg" -Level "ERROR" -Color "Red" -MsgID $MsgID
-            return $false # Hard Fail: Kill the process for this file
+            return $false 
         }
     }
 }
@@ -169,7 +173,7 @@ foreach ($item in $criticalPaths.GetEnumerator()) {
     if ($item.Name -eq "SMBDestination" -and $simulateSMB -eq $true) {
         continue
     }
-    if (-not (Test-Path -Path $item.Value)) {
+    if (-not (Test-Path -LiteralPath $item.Value)) {
         Write-Log "[FAIL] Pre-Flight Error: $($item.Name) path does not exist on disk: $($item.Value)" -Level "ERROR" -Color "Red" -MsgID "SYS"
         throw "ValidationFailed: Path not found - $($item.Value)"
     }
@@ -233,6 +237,7 @@ $genericDomains = $config.Email.GenericDomains
 $internalDomains = $config.Email.InternalDomains
 $allowedDocs   = $config.Email.AllowedDocs
 $allowedImages = $config.Email.AllowedImages
+$batchSize = if ($config.Email.BatchSize) { [int]$config.Email.BatchSize } else { 20 }
 #Merges the allowed docs list and the allowed images list
 $allowedExtensions= $allowedDocs + $allowedImages
 $minImageSize = if ($config.Email.MinImageSizeBytes) { $config.Email.MinImageSizeBytes } else { 30000 }
@@ -247,8 +252,8 @@ $simulateSMB = $config.Paths.SimulateSMB
 $simulateMove = $config.Email.SimulateMove
 
 # --- LOG FOLDER VERIFICATION ---
-if (-not (Test-Path -Path $config.Paths.LogFolder)) {
-    New-Item -ItemType Directory -Force -Path $config.Paths.LogFolder | Out-Null
+if (-not (Test-Path -LiteralPath $config.Paths.LogFolder)) {
+    New-Item -ItemType Directory -Force -LiteralPath $config.Paths.LogFolder | Out-Null
 }
 
 # ==========================================
@@ -283,7 +288,7 @@ try {
         $filterQuery = "isRead eq false and hasAttachments eq true"
     }
     
-    $messages = Get-MgUserMailFolderMessage -UserId $targetMailbox -MailFolderId "Inbox" -all -Filter $filterQuery -Select "id,subject,from,receivedDateTime,hasAttachments"
+    $messages = Get-MgUserMailFolderMessage -UserId $targetMailbox -MailFolderId "Inbox" -All -Filter $filterQuery -Select "id,subject,from,receivedDateTime,hasAttachments"
 
     if ($messages.Count -eq 0) {
         Write-Log "[INFORMATIONAL] No new emails with attachments found." -Level "INFO" -Color "Yellow"
@@ -299,9 +304,15 @@ try {
             $mailboxFolders = @()
         }
     }
-
+    # --- SMART BATCH TRACKING ---
+    $processedCount = 0
     # Loop through each message
     foreach ($msg in $messages) {
+        # 1. Check if we have hit our processing limit for this run
+        if ($processedCount -ge $batchSize) {
+            Write-Log " [BATCH LIMIT] Reached maximum of $batchSize processed invoices. Pausing remaining queue until next run." -Level "INFO" -Color "Cyan"
+            break # Exits the foreach loop completely
+        }
         # Generate short Message Correlation ID
         $MsgID = if ($msg.Id.Length -ge 8) { $msg.Id.Substring($msg.Id.Length - 8) } else { "UNKNOWN" }
         # Assume success until a failure occurs
@@ -332,7 +343,7 @@ try {
             $matchedWord = $matches[0]
         }
         
-        $attachments = Get-MgUserMessageAttachment -UserId $targetMailbox -MessageId $msg.Id -Select "id,name,contentType,size"
+        $attachments = Get-MgUserMessageAttachment -UserId $targetMailbox -MessageId $msg.Id -Select "id,name,contentType,size,isInline"
         
         if (-not $hasKillKeyword -and $attachments) {
             foreach ($att in $attachments) {
@@ -378,11 +389,17 @@ try {
                 Write-Log " [GOOD] Matched via Vendor Match -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                 break
             }
-            # TIER 2: Display Name "Deep Scan" 
-            # Checks Supplier Name OR AP List OR Vendor Match column against the email's Display Name
-            if (($csvSupplierName -ne "" -and $senderDisplayName -match [regex]::Escape($csvSupplierName)) -or 
-                ($csvApVendorList -ne "" -and $senderDisplayName -match [regex]::Escape($csvApVendorList)) -or
-                ($csvVendorMatch  -ne "" -and $senderDisplayName -match [regex]::Escape($csvVendorMatch))) {
+            # TIER 2: Display Name "Deep Scan" (Alphabetical Boundary Match)
+            # Wraps the CSV names in negative lookarounds. It ensures that the matched name 
+            # does not have alphabetical characters touching it on either side, preventing "SMI" from matching "Smith".
+            
+            $regexSupplier = "(?<![a-zA-Z])" + [regex]::Escape($csvSupplierName) + "(?![a-zA-Z])"
+            $regexAPList   = "(?<![a-zA-Z])" + [regex]::Escape($csvApVendorList) + "(?![a-zA-Z])"
+            $regexVendor   = "(?<![a-zA-Z])" + [regex]::Escape($csvVendorMatch) + "(?![a-zA-Z])"
+
+            if (($csvSupplierName -ne "" -and $senderDisplayName -match $regexSupplier) -or 
+                ($csvApVendorList -ne "" -and $senderDisplayName -match $regexAPList) -or
+                ($csvVendorMatch  -ne "" -and $senderDisplayName -match $regexVendor)) {
                 
                 $supplierName = $csvSupplierName
                 Write-Log " [GOOD] Matched via Display Name Tag -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
@@ -400,15 +417,18 @@ try {
             Write-Log " [GOOD] Matched via Corporate Domain (Fallback) -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
         }
 
-        if ($supplierName -eq "Unknown" -and $fallbackSupplier -ne "Unknown") {
-            $supplierName = $fallbackSupplier
-            Write-Log " [GOOD] Matched via Corporate Domain (Fallback) -> $supplierName" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
-        }
-
         if ($supplierName -eq "Unknown") {
-            Write-Log " [WARNING] No Match Found for '$senderEmail'. Leaving email untouched in Inbox." -Level "WARN" -Color "Yellow" -MsgID $MsgID
-            Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Untouched (Unknown Vendor)" -LogType "Runtime" -MsgID $MsgID
-            continue 
+            # Check if the reason it's unknown is because it's an internal domain
+            if ($internalDomains -and $senderDomain -in $internalDomains) {
+                Write-Log " [SKIP] Internal Sender Detected: '$senderEmail'. Leaving email untouched in Inbox." -Level "WARN" -Color "Magenta" -MsgID $MsgID
+                Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Untouched (Internal Sender)" -LogType "Runtime" -MsgID $MsgID
+                continue 
+            } else {
+                # It's an actual unknown external sender
+                Write-Log " [WARNING] No Match Found for '$senderEmail'. Leaving email untouched in Inbox." -Level "WARN" -Color "Yellow" -MsgID $MsgID
+                Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Untouched (Unknown Vendor)" -LogType "Runtime" -MsgID $MsgID
+                continue 
+            }
         } else {
             # --- NEW SYNCHRONIZED FOLDER LOGIC (v1.11) ---
             $firstLetter = $supplierName.Substring(0,1).ToUpper()
@@ -425,7 +445,7 @@ try {
 
             # 1. Resolve SMB Path (Discover actual folder name on share like 'A - Invoices' or '123 - Folder')
             try {
-                $matchedSmbDir = Get-ChildItem -Path $config.Paths.SMBDestination -Directory -ErrorAction SilentlyContinue | 
+                $matchedSmbDir = Get-ChildItem -LiteralPath $config.Paths.SMBDestination -Directory -ErrorAction SilentlyContinue | 
                                  Where-Object { $_.Name -match $expectedPattern } | Select-Object -First 1
                 
                 $finalSmbPath = if ($matchedSmbDir) { $matchedSmbDir.FullName } else { Join-Path $config.Paths.SMBDestination $targetSubFolder }
@@ -446,10 +466,25 @@ try {
 
         if ($attachments) {
             foreach ($att in $attachments) {
+                
+                # 1. Figure out the extension FIRST so the logic below can use it
                 $ext = [System.IO.Path]::GetExtension($att.Name).ToLower()
+
+                # 2. THE INLINE GATE
+                if ($att.IsInline -eq $true) {
+                    # If it is an image AND (it's tiny OR named like a signature), skip it
+                    if ($ext -match $imageRegex -and ($att.Size -lt $minImageSize -or $att.Name -match "(?i)(outlook|hoguebanner|facebook|logo|youtube|^image\d*\.png$)")) {
+                        Write-Log "  -> [SKIP] Ignored Inline Signature Image: $($att.Name)" -Level "INFO" -Color "DarkGray" -MsgID $MsgID
+                        continue
+                    }
+                }
+
+                # 3. Standard allowed extensions check
                 if ($ext -in $allowedExtensions) {
+                    
+                    # Catch tiny attached images that somehow weren't flagged as inline
                     if ($ext -match $imageRegex -and $att.Size -lt $minImageSize) {
-                        Write-Log "  -> [SKIP] Ignored Tiny Image: $($att.Name)" -Level "INFO" -Color "DarkGray" -MsgID $MsgID
+                        Write-Log "  -> [SKIP] Ignored Tiny Attached Image: $($att.Name)" -Level "INFO" -Color "DarkGray" -MsgID $MsgID
                         continue
                     }
 
@@ -458,20 +493,29 @@ try {
                     # Ensure we use the function to sanitize both Supplier and Original File Name
                     $nameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($att.Name)
                     $baseName = Format-InvoiceName -SupplierName $supplierName -OriginalFileName $nameWithoutExt
+                    $baseName = "${baseName}"
+                    #_${dateStamp}"
                     
                     # --- FIXED COLLISION LOGIC ---
                     # 1. Determine staging extension BEFORE the collision check
                     $stagingExt = if ($ext -match $docRegex -or $ext -match $imageRegex) { $ext } else { ".pdf" }
                     
+                    # Determine the FINAL destination extension (.xls bypass keeps .xls, everything else gets .pdf)
+                    $destExt = if ($ext -match "\.xls$") { $ext } else { ".pdf" }
+                    
                     $counter = 0
-                    $finalPdfName = "$baseName.pdf"
+                    
+                    # Set initial target names
+                    $finalPdfName = "$baseName$destExt"
                     $currentStagingName = "$baseName$stagingExt"
                     
-                    # 2. Check BOTH the SMB (.pdf) and the local staging folder (actual extension)
-                    while ((Test-Path (Join-Path $finalSmbPath $finalPdfName)) -or (Test-Path (Join-Path $config.Paths.Staging $currentStagingName))) {
+                    # 2. Check BOTH the SMB target and the local staging folder
+                    while ((Test-Path -LiteralPath (Join-Path $finalSmbPath $finalPdfName)) -or (Test-Path -LiteralPath (Join-Path $config.Paths.Staging $currentStagingName))) {
                         $counter++
                         $paddedCounter = "{0:D2}" -f $counter
-                        $finalPdfName = "$baseName($paddedCounter).pdf"
+                        
+                        # Apply the dynamic extensions so bypassed files keep their format!
+                        $finalPdfName = "$baseName($paddedCounter)$destExt"
                         $currentStagingName = "$baseName($paddedCounter)$stagingExt"
                     }
                     # -----------------------------
@@ -491,25 +535,116 @@ try {
                         Start-Sleep -Milliseconds 500
                         
                         if ($ext -match $docRegex -and $ext -ne ".pdf") {
-                            if ($ext -match "\.(xlsx|xls)$") {
+                            
+                            
+                            # --- 1. THE .XLS RAW BYPASS ---
+                            if ($ext -match "\.xls$") {
+                                Write-Log "  -> [BYPASS] Legacy .xls detected. Skipping PDF conversion and keeping raw file." -Level "INFO" -Color "Cyan" -MsgID $MsgID
+                                
+                                if (Test-Path -LiteralPath $stagingPath) {
+                                    # Add the raw .xls file directly to the move queue
+                                    $filesToMove += $stagingPath
+                                    # Log the actual .xls name, not the .pdf name
+                                    $processedFileNames += $currentStagingName
+                                } else {
+                                    Write-Log "  -> [FAIL] File not found in staging: $stagingPath" -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                    $allAttachmentsSuccessful = $false
+                                }
+
+<# ======================= OLD UPGRADE LOGIC COMMENTED OUT =======================
+                            Write-Log "  -> [CONVERTING] Starting LibreOffice upgrade: $stagingPath" -Level "INFO" -Color "Cyan" -MsgID $MsgID
+                            Write-Log "  -> [CONVERTING] Upgrading legacy .xls to .xlsx to apply Landscape formatting..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
+
+                            # --- DEBUG BLOCK START ---
+                            Write-Log "  -> [DEBUG] XLS source exists BEFORE conversion: $(Test-Path $stagingPath)" -Level "DEBUG" -Color "Gray" -MsgID $MsgID
+                            Write-Log "  -> [DEBUG] Target staging directory: $($config.Paths.Staging)" -Level "DEBUG" -Color "Gray" -MsgID $MsgID
+                            # --- DEBUG BLOCK END ---
+                            
+                            $xlsProcess = Start-Process -FilePath "libreoffice" `
+                                -ArgumentList "--headless", "--convert-to", "xlsx", "`"$stagingPath`"", "--outdir", "`"$($config.Paths.Staging)`"" `
+                                -PassThru
+
+                            # --- DEBUG BLOCK START ---
+                            Write-Log "  -> [DEBUG] LibreOffice process started. PID: $($xlsProcess.Id)" -Level "DEBUG" -Color "Gray" -MsgID $MsgID
+                            # --- DEBUG BLOCK END ---
+
+                            if ($xlsProcess.WaitForExit(60000) -and $xlsProcess.ExitCode -eq 0) {
+                                
+                                # --- DEBUG BLOCK START ---
+                                Write-Log "  -> [DEBUG] LibreOffice exited successfully. ExitCode: $($xlsProcess.ExitCode)" -Level "DEBUG" -Color "Gray" -MsgID $MsgID
+                                # --- DEBUG BLOCK END ---
+                                
+                                $upgradedPath = [System.IO.Path]::ChangeExtension($stagingPath, ".xlsx")
+
+                                # --- DEBUG BLOCK START ---
+                                Write-Log "  -> [DEBUG] Expected upgraded file path: $upgradedPath" -Level "DEBUG" -Color "Gray" -MsgID $MsgID
+                                Write-Log "  -> [DEBUG] XLSX exists AFTER conversion: $(Test-Path $upgradedPath)" -Level "DEBUG" -Color "Gray" -MsgID $MsgID
+                                # --- DEBUG BLOCK END ---
+
+                                if (Test-Path -LiteralPath $upgradedPath) {
+                                    Write-Log "  -> [GOOD] XLS upgrade successful: $upgradedPath" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+
+                                    # --- DEBUG BLOCK START ---
+                                    Write-Log "  -> [DEBUG] Removing original XLS: $stagingPath" -Level "DEBUG" -Color "Gray" -MsgID $MsgID
+                                    # --- DEBUG BLOCK END ---
+
+                                    # Delete the old binary .xls
+                                    Remove-Item -LiteralPath $stagingPath -Force
+
+                                    # Trick the script into treating it like an .xlsx from here on out
+                                    $stagingPath = $upgradedPath
+                                    $ext = ".xlsx"
+
+                                    # --- DEBUG BLOCK START ---
+                                    Write-Log "  -> [DEBUG] Updated stagingPath to: $stagingPath" -Level "DEBUG" -Color "Gray" -MsgID $MsgID
+                                    Write-Log "  -> [DEBUG] Updated extension to: $ext" -Level "DEBUG" -Color "Gray" -MsgID $MsgID
+                                    # --- DEBUG BLOCK END ---
+                                }
+                                else {
+                                    Write-Log "  -> [FAIL] XLS upgrade reported success but file NOT FOUND at expected path." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                }
+                            } else {
+                                # --- DEBUG BLOCK START ---
+                                Write-Log "  -> [DEBUG] LibreOffice exit code: $($xlsProcess.ExitCode)" -Level "DEBUG" -Color "Gray" -MsgID $MsgID
+                                Write-Log "  -> [DEBUG] WaitForExit result: $($xlsProcess.HasExited)" -Level "DEBUG" -Color "Gray" -MsgID $MsgID
+                                # --- DEBUG BLOCK END ---
+
+                                Write-Log "  -> [WARN] Failed to upgrade .xls. LibreOffice will attempt to process raw file." -Level "WARN" -Color "Yellow" -MsgID $MsgID
+                            }
+============================================================================== #>
+
+                                # This command skips the rest of the conversion logic below and jumps to the next attachment!
+                                continue 
+                            }
+                            # ----------------------------------
+
+                            # --- 2. THE FORMATTING GATE ---
+                            # Legacy .xls files bypass this completely. This strictly formats modern .xlsx files.
+                            if ($ext -match "\.xlsx$") {
                                 # If it returns $false, the file is genuinely corrupted. Kill it.
                                 if (-not (Format-ExcelForPdf -FilePath $stagingPath -MsgID $MsgID)) {
-                                    Write-Log "   -> [SKIP] Skipping conversion due to fatal Excel error. Deleting corrupted file." -Level "ERROR" -Color "Red" -MsgID $MsgID
-                                    Remove-Item -Path $stagingPath -Force -ErrorAction SilentlyContinue
+                                    Write-Log "   -> [FAIL] Skipping conversion due to fatal Excel error. Deleting corrupted file." -Level "ERROR" -Color "Red" -MsgID $MsgID
+                                    Remove-Item -LiteralPath $stagingPath -Force -ErrorAction SilentlyContinue
                                     $allAttachmentsSuccessful = $false
                                     continue 
                                 }
                             }
 
+                            # --- 3. FINAL PDF CONVERSION ---
                             Write-Log "  -> [CONVERTING] Running LibreOffice Headless on $ext (Max 60s timeout)..." -Level "INFO" -Color "Cyan" -MsgID $MsgID
-                            # REMOVED -Wait here so the timeout below actually works
-                            $process = Start-Process -FilePath "libreoffice" -ArgumentList "--headless", "--convert-to", "pdf", "`"$stagingPath`"", "--outdir", "`"$($config.Paths.Staging)`"" -PassThru
+                            
+                            # --- DYNAMIC EXPORT FILTER ---
+                            # Protects Word Docs by ONLY applying the strict Calc filter to Excel files
+                            $exportFormat = if ($ext -match "\.xlsx?$") { "pdf:calc_pdf_Export" } else { "pdf" }
+                            
+                            # Notice we swapped "pdf" for "$exportFormat" in the ArgumentList below
+                            $process = Start-Process -FilePath "libreoffice" -ArgumentList "--headless", "--convert-to", "$exportFormat", "`"$stagingPath`"", "--outdir", "`"$($config.Paths.Staging)`"" -PassThru
                             
                             if ($process.WaitForExit(60000)) {
                                 $pdfPath = [System.IO.Path]::ChangeExtension($stagingPath, ".pdf")
-                                if ($process.ExitCode -eq 0 -and (Test-Path -Path $pdfPath)) {
+                                if ($process.ExitCode -eq 0 -and (Test-Path -LiteralPath $pdfPath)) {
                                     Write-Log "  -> [GOOD] Document successfully converted to PDF!" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
-                                    Remove-Item -Path $stagingPath -Force
+                                    Remove-Item -LiteralPath $stagingPath -Force
                                     $filesToMove += $pdfPath
                                     $processedFileNames += $finalPdfName
                                 } else {
@@ -533,11 +668,11 @@ try {
                             
                             if ($process.WaitForExit(60000)) {
                                 # 3. PHYSICAL REALITY CHECK: Check ExitCode AND verify the file exists on the disk
-                                if ($process.ExitCode -eq 0 -and (Test-Path -Path $pdfPath)) {
+                                if ($process.ExitCode -eq 0 -and (Test-Path -LiteralPath $pdfPath)) {
                                     Write-Log "  -> [GOOD] Image successfully converted to PDF!" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                                     
                                     # Cleanup: Remove the original image (e.g., the .jpg) now that the .pdf exists
-                                    Remove-Item -Path $stagingPath -Force
+                                    Remove-Item -LiteralPath $stagingPath -Force
                                     
                                     # Add ONLY the verified PDF path to the move list
                                     $filesToMove += $pdfPath
@@ -555,7 +690,7 @@ try {
                             }
                         }
                         elseif ($ext -eq ".pdf") {
-                            if (Test-Path -Path $stagingPath) {
+                            if (Test-Path -LiteralPath $stagingPath) {
                                 $filesToMove += $stagingPath
                                 $processedFileNames += $finalPdfName
                             } else {
@@ -585,9 +720,11 @@ try {
                         $errInfo = if ($config.Logging.Verbose) { "$($_.Exception.Message) (Line: $($_.InvocationInfo.ScriptLineNumber))" } else { $_.Exception.Message }
                         Write-Log "  -> [FAIL] Attachment Process Failed: $errInfo" -Level "ERROR" -Color "Red" -MsgID $MsgID
                         $allAttachmentsSuccessful = $false
-                    }
-                }
+                    } 
             }
+            else {
+                        Write-Log "  -> [SKIP] Unsupported file type '$ext' for attachment '$($att.Name)'. Skipping." -Level "WARN" -Color "Yellow" -MsgID $MsgID}
+                }
         }
 
         if ($validAttachments.Count -eq 0) {
@@ -601,18 +738,18 @@ try {
         Start-Sleep -Seconds 1 
         
         if ($simulateSMB -eq $true) {
-            if (Test-Path -Path $finalSmbPath) {
+            if (Test-Path -LiteralPath $finalSmbPath) {
                 Write-Log "   [GOOD] Folder Exists on SMB Share." -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                 Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Processed (Simulation) - Attachments renamed to `"$($processedFileNames -join '", "')`" placed in folder `"$finalSmbPath`"" -LogType "Runtime" -MsgID $MsgID
             } else {
                 Write-Log "   [FAIL] SMB Target Folder DOES NOT EXIST ($finalSmbPath)" -Level "ERROR" -Color "Red" -MsgID $MsgID
             }
         } else {
-            if (Test-Path -Path $finalSmbPath) {
+            if (Test-Path -LiteralPath $finalSmbPath) {
                 foreach ($file in $filesToMove) {
                     try { 
-                        if (Test-Path -Path $file) {
-                            Move-Item -Path $file -Destination $finalSmbPath -Force 
+                        if (Test-Path -LiteralPath $file) {
+                            Move-Item -LiteralPath $file -Destination $finalSmbPath -Force 
                             Write-Log "   -> [MOVED] Successfully moved to SMB: $(Split-Path $file -Leaf)" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
                         } else {
                             Write-Log "   -> [FAIL] Move Skipped: File disappeared from staging before move: $(Split-Path $file -Leaf)" -Level "ERROR" -Color "Red" -MsgID $MsgID
@@ -621,7 +758,7 @@ try {
                         Write-Log "   -> [FAIL] Move Failed: $($_.Exception.Message)" -Level "ERROR" -Color "Red" -MsgID $MsgID
                     }
                 }
-                Write-Log "From:$senderEmail - Subject:$($msg.Subject) - AttachmentCount:$($attachments.Count) - Processed - Attachments renamed to `"$($processedFileNames -join '", "')`" placed in folder `"$finalSmbPath`"" -LogType "Runtime" -MsgID $MsgID
+                Write-Log "From:$senderEmail - Subject:$($msg.Subject) - TotalAttachmentCount:$($attachments.Count) - Processed:$($validAttachments.Count) - Attachments renamed to `"$($processedFileNames -join '", "')`" placed in folder `"$finalSmbPath`"" -LogType "Runtime" -MsgID $MsgID
             } else {
                 Write-Log "   [FAIL] Target SMB Folder DOES NOT EXIST ($finalSmbPath). Files left in Staging." -Level "ERROR" -Color "Red" -MsgID $MsgID
             }
@@ -644,6 +781,7 @@ try {
                     Update-MgUserMessage -UserId $targetMailbox -MessageId $msg.Id -IsRead -ErrorAction Stop | Out-Null
                     Move-MgUserMessage -UserId $targetMailbox -MessageId $msg.Id -DestinationId $targetMailFolder.Id -ErrorAction Stop | Out-Null
                     Write-Log "   [MOVED] Email marked as read and moved to mailbox folder: $($targetMailFolder.DisplayName)" -Level "SUCCESS" -Color "Green" -MsgID $MsgID
+                    $processedCount++
                 } catch {
                     Write-Log "   [FAIL] Failed to update/move email in mailbox: $($_.Exception.Message)" -Level "ERROR" -Color "Red" -MsgID $MsgID
                 }
@@ -697,6 +835,6 @@ finally {
         }
     }
     if (Test-Path $lockFile) {
-        Remove-Item -Path $lockFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $lockFile -Force -ErrorAction SilentlyContinue
     }
 }
