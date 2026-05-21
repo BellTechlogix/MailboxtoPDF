@@ -1,0 +1,12 @@
+# =====================================================================
+# PRODUCTION TIERED SCHEDULE (SERVER IN UTC)
+# =====================================================================
+
+# 1. BUSINESS HOURS (Mon-Fri, 7:00 AM - 6:55 PM EDT): Runs every 5 minutes
+*/5 11-22 * * 1-5 /usr/bin/pwsh /opt/ap-automation/MailboxAutomation.ps1
+
+# 2. WEEKNIGHTS (Mon-Fri, 7:00 PM - 6:59 AM EDT): Runs every 3 hours (7pm, 10pm, 1am, 4am EDT)
+0 2,5,8,23 * * 1-5 /usr/bin/pwsh /opt/ap-automation/MailboxAutomation.ps1
+
+# 3. WEEKENDS (Sat-Sun, All Day Continuous): Runs every 3 hours anchor-aligned
+0 2,5,8,11,14,17,20,23 * * 0,6 /usr/bin/pwsh /opt/ap-automation/MailboxAutomation.ps1
